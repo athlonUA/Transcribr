@@ -17,8 +17,9 @@ into a single `.m4a` (AAC) file, then optionally transcribes the result via Open
 - Real-time mix via a custom `AVAudioMixerNode`; the engine is muted at the main mixer so nothing plays back through the speakers.
 - A canonical mix format (48 kHz / stereo / Float32 non-interleaved) is enforced end-to-end across the engine, the tap, the player node and the file, so AAC encoding never resamples on an unspecified path.
 - The tap deep-copies each render buffer and dispatches AAC encoding to a dedicated writer queue, keeping the audio render thread free of disk I/O.
-- A 2-second watchdog aborts the recording with a clear error if `SCStream` starts but delivers no audio samples — this enforces the "no mic-only file" spec requirement against silent SCK stalls.
-- `AVAudioEngineConfigurationChange` (e.g. plugging/unplugging Bluetooth mid-recording) stops the recording with a user-visible error rather than silently truncating.
+- A 2-second watchdog aborts the recording if `SCStream` starts but delivers no audio samples — this enforces the "no mic-only file" spec requirement against silent SCK stalls. The auto-restart path uses a silent variant of the same watchdog so a slow device hand-off doesn't surface a misleading "no system audio" banner.
+- `AVAudioEngineConfigurationChange` (plugging/unplugging headphones, AirPods (dis)connect, default device switched) triggers an **auto-restart**: the current `.m4a` is finalized and a fresh session is spun up on the new device. The user gets N short files per session (one per route change) instead of one mixed-rate file AAC can't represent cleanly. The popover shows a Cancel button during the brief `.stopping` window so the user can abandon a route-change restart they don't want.
+- Mic is captured whenever microphone permission is granted, regardless of output device. Apple's Voice Processing IO (AEC) is **not** used — empirically it doesn't cancel system-mixer playback in this pipeline (VPIO references the unit's own output path, not the system mixer). The trade-off: recording without headphones while system audio plays will pick up acoustic echo through the mic. For clean recordings with system audio, use headphones.
 - Custom 5-bar animated waveform tray icon (template `NSImage` redrawn at 12 fps by a `Timer.publish` while recording); same icon is reused in the popover header for visual consistency.
 
 ## Transcription
@@ -71,12 +72,11 @@ Or open `Transcribr.xcodeproj` in Xcode and hit Run.
 
 ## Required permissions
 
-Recording requires **two** macOS permissions (Start Record stays disabled until both are granted):
+- **Screen Recording** is **mandatory** — required by `ScreenCaptureKit` to capture system audio (the floor of every recording). Two-step:
+  - Click **Request Screen Recording Access** in the popover banner. macOS adds Transcribr to System Settings → Privacy & Security → Screen Recording and shows a notification directing you there.
+  - Enable Transcribr in that pane, then **restart the app**. macOS does not propagate a freshly-granted screen-recording permission to an already-running process — long-standing OS behaviour, not a bug.
 
-1. **Microphone** — granted in-process. When you click Start Record for the first time, macOS shows a TCC prompt with the usage description string; one click grants.
-2. **Screen Recording** — required by `ScreenCaptureKit` to capture system audio. Two-step:
-   - Click the **Request Screen Recording Access** button in the popover banner. macOS adds Transcribr to System Settings → Privacy & Security → Screen Recording and shows a notification directing you there.
-   - Enable Transcribr in that pane, then **restart the app**. macOS does not propagate a freshly-granted screen-recording permission to an already-running process — long-standing OS behaviour, not a bug.
+- **Microphone** is **optional**. macOS shows a TCC prompt on first Start; granting it adds your voice to every subsequent recording. Denying it (or revoking later in System Settings) doesn't block the app — sessions just capture system audio only.
 
 Transcription only needs a valid OpenAI API key — no extra system permission.
 
@@ -87,15 +87,20 @@ xcodebuild -project Transcribr.xcodeproj -scheme Transcribr \
   -configuration Debug -destination 'platform=macOS' test
 ```
 
-Current coverage: **29 unit tests** across two suites.
+Current coverage: **52 unit tests** across two suites.
 
-`AudioRecorderTests` (22):
+`AudioRecorderTests` (45):
 - File-name format, single-digit padding.
 - Microphone permission status mapping (all four `AVAuthorizationStatus` cases).
 - `formatsAreEquivalent` helper (sample rate / channel count / interleaving / identical).
 - `canonicalFormat` invariants.
 - `formatDuration` for zero, seconds-only, minutes, padding, hours, negative, sub-second, NaN, ±Infinity, 24h, week-long.
 - `makePCMBuffer` passthrough, sample-rate conversion, converter reuse and recreate (tests construct synthetic `CMSampleBuffer`s and feed them through the real conversion code path).
+- `MultipartFilename.sanitize` — passthrough, CRLF stripping, quote replacement, combined edge cases.
+- `EnvLoader.parseValue` — simple key/value, CRLF files, quoted values, comment skipping, missing key/file.
+- `ChunkPlanner.plan` — AAC size-based, AAC duration-capped, re-encode fixed target, zero-duration fallback, positive advance.
+- `shouldStartAfterRestart` — auto-restart decision truth table (state × cancel).
+- `canStart` — UI gating truth table (mic optional, screen mandatory).
 
 `RecordsDirectoryStoreTests` (7):
 - Defaults, init with/without stored value, persistence round-trip across re-init, directory creation, idempotency.
@@ -104,36 +109,38 @@ The wired-up audio capture path (engine pulling from the HAL + SCStream samples 
 
 ## Manual test plan
 
-After granting both permissions and restarting, run through this matrix. For each row, record ~10 seconds while speaking and playing system audio, then play back the resulting `.m4a` from your records directory (default `~/Documents/Transcribr/`).
+After granting Screen Recording and restarting, run through this matrix. For each row, record ~10 seconds while speaking and playing system audio, then play back the resulting `.m4a` from your records directory (default `~/Documents/Transcribr/`).
 
 | # | Scenario | Output device | Source of system audio | My voice recorded | System audio recorded | Result |
 |---|---|---|---|---|---|---|
-| 1 | Basic | Built-in speakers | _(silence)_ | Yes / No | N/A | Pass / Fail |
-| 2 | Basic | Built-in speakers | Music player (Apple Music / Spotify) | Yes / No | Yes / No | Pass / Fail |
-| 3 | Basic | Built-in speakers | Browser video (YouTube) | Yes / No | Yes / No | Pass / Fail |
-| 4 | Basic | Wired headphones | Music player | Yes / No | Yes / No | Pass / Fail |
-| 5 | Basic | Wired headphones | Browser video | Yes / No | Yes / No | Pass / Fail |
-| 6 | Basic | Bluetooth headphones | Music player | Yes / No | Yes / No | Pass / Fail |
-| 7 | Basic | Bluetooth headphones | Browser video | Yes / No | Yes / No | Pass / Fail |
+| 1 | Basic | Built-in speakers | _(silence)_ | Yes | N/A | Pass / Fail |
+| 2 | Basic | Built-in speakers | Music player (Apple Music / Spotify) | Yes (echo expected) | Yes | Pass / Fail |
+| 3 | Basic | Built-in speakers | Browser video (YouTube) | Yes (echo expected) | Yes | Pass / Fail |
+| 4 | Basic | Wired headphones (3.5mm jack) | Music player | Yes | Yes | Pass / Fail |
+| 5 | Basic | Wired headphones | Browser video | Yes | Yes | Pass / Fail |
+| 6 | Basic | Bluetooth headphones / AirPods | Music player | Yes | Yes | Pass / Fail |
+| 7 | Basic | Bluetooth headphones / AirPods | Browser video | Yes | Yes | Pass / Fail |
+| 8 | Auto-restart | Plug headphones mid-recording | Music player | Yes (continues across files) | Yes (continues across files) | Pass / Fail |
+| 9 | Cancel auto-restart | Plug/unplug headphones, tap **Cancel** during `.stopping` | Music player | N/A | First file finalized; no second session | Pass / Fail |
+| 10 | Mic denied | Any | Music player | No (permission denied) | Yes | Pass / Fail |
 
 Optional extras (smoke, not gates):
 
-- Messenger or video call (Telegram, WhatsApp, Zoom, Google Meet)
-- Native macOS notification sound (e.g. a Calendar alert during recording)
-- A game's audio output
-- A second simultaneous source (music + video at the same time)
+- Messenger or video call (Telegram, WhatsApp, Zoom, Google Meet) — on speakers expect the remote voice to be echoed into the mic channel.
+- Native macOS notification sound (e.g. a Calendar alert during recording).
+- A game's audio output.
+- A second simultaneous source (music + video at the same time).
 
-**Pass criterion**: on playback, both your voice **and** whatever system audio was playing at the time are clearly audible in the same file.
+**Pass criterion**: on playback, both your voice **and** whatever system audio was playing at the time are clearly audible in the same file. Rows 2 and 3 will additionally show acoustic echo (system audio doubled through the mic) — this is the documented trade-off of recording on speakers without echo cancellation; use headphones to avoid it.
 
 For transcription, after one of the rows passes: paste an API key in Transcription Settings → press **Transcribe Last** → confirm the green `Transcription copied` banner and that pasting (Cmd-V) into a text editor produces the transcript.
 
 ## Known limitations
 
-- **Voice Processing AU may coerce the mic to mono.** When `setVoiceProcessingEnabled(true)` is applied to the input node, macOS swaps in the VoIP audio unit which can change the input format — most often that means stereo USB / built-in mic gets downmixed to mono before reaching the engine. The downstream `customMixer` resamples back to the canonical 48 kHz / stereo so the mix path stays valid and quality is fine for voice, but you lose any stereo separation the mic was capturing. If you need a true stereo mic capture, the VP path will not give it to you.
-- **Bluetooth + microphone input quality.** When a Bluetooth headset is selected as the input device, macOS may switch the link into HFP profile (16 kHz mono telephony). The mic track will then be 16 kHz; the system-audio track captured by `SCStream` is unaffected (still 48 kHz stereo, pre-HAL). This is a macOS Bluetooth limitation — for best mic quality, use the built-in mic or a wired/USB mic and keep BT for output only.
+- **Speaker → mic echo without headphones.** When recording with system audio playing through the laptop speakers, the mic picks up the same audio acoustically. The file then contains every system-audio voice twice — once digitally clean via `SCStream`, once delayed/reverbed via the mic. Apple's Voice Processing IO doesn't help (it references the unit's own output path, not the system mixer's playback). For clean recordings with system audio, use headphones. Future fix options: a two-track output mode that doesn't mix mic and system, or vendoring WebRTC's AEC3.
+- **Bluetooth + microphone input quality.** When a Bluetooth headset is selected as the input device, macOS may switch the link into HFP profile (16 kHz mono telephony). The mic track will then be 16 kHz; the system-audio track captured by `SCStream` is unaffected (still 48 kHz stereo, pre-HAL). For best mic quality, use the built-in mic or a wired/USB mic and keep BT for output only.
+- **Auto-restart produces multiple files per session.** Every `AVAudioEngineConfigurationChange` finalizes the current `.m4a` and starts a fresh one — a session where you toggle headphones four times yields five files. Each file is independently transcribable; their `recording-<timestamp>.m4a` names sort chronologically so they're easy to reassemble in post.
 - **Screen Recording permission needs a restart** after the user first enables it in System Settings. macOS does not propagate the new permission to a running process. The app detects this and shows a banner.
-- **Recording stops on audio-device changes**: if you plug or unplug headphones/Bluetooth mid-recording, the engine emits `AVAudioEngineConfigurationChange`. The app stops the recording with an explicit error rather than continuing to write silence into a half-broken graph. Restart the recording after the device change settles.
-- **Acoustic echo cancellation is enabled by default.** Voice Processing AU references the system output device's playback signal and subtracts it from the mic input, so e.g. a Google Meet call played through laptop speakers does not get re-captured by the mic (it is still captured cleanly via `SCStream`). Residual echo can still appear on hardware where Voice Processing fails silently.
 - **API key is stored in `UserDefaults` plaintext** (`~/Library/Preferences/com.transcribr.Transcribr.plist`). Convenient for a local dev app but inappropriate for a shipped binary — a production version should migrate this storage to Keychain.
 - **Ad-hoc code signing reshuffles TCC.** Building from Xcode produces a new CDHash on every source change, and macOS's TCC database keys Screen Recording grants by CDHash for ad-hoc-signed apps. Practical upshot: each rebuild may require re-granting Screen Recording (toggle in Settings → restart). Real Developer ID signing (TeamID-based) eliminates this churn for shipped builds.
 - **No MP3 export.** Recording output is AAC `.m4a` only; MP3 can be added later via `AVAssetExportSession` or `ffmpeg`.

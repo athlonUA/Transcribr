@@ -128,7 +128,10 @@ final class AudioRecorder: NSObject, ObservableObject {
     private var currentAccumulatedText: String = ""
 
     var canStart: Bool {
-        state == .idle && micPermission != .denied && screenPermission == .granted
+        // Mic is optional — a denied mic just makes the session system-audio-only via
+        // `buildSession`'s `micEnabled = false` branch. Only screen permission is mandatory,
+        // because that's the floor: without it we can't capture system audio at all.
+        state == .idle && screenPermission == .granted
     }
 
     init(directoryStore: RecordsDirectoryStore, settingsStore: SettingsStore) {
@@ -197,6 +200,18 @@ final class AudioRecorder: NSObject, ObservableObject {
         micPermission = AudioRecorder.mapMicStatus(AVCaptureDevice.authorizationStatus(for: .audio))
     }
 
+    #if DEBUG
+    /// Test-only seam: forces specific permission values so unit tests can assert the
+    /// `canStart` truth table without depending on the running machine's actual TCC state.
+    /// Guarded by `#if DEBUG` so production builds can't accidentally route around the real
+    /// permission probes.
+    @MainActor
+    func overridePermissionsForTesting(mic: MicrophonePermission, screen: ScreenCapturePermission) {
+        micPermission = mic
+        screenPermission = screen
+    }
+    #endif
+
     private func probeScreenAccess() async -> ScreenCapturePermission {
         do {
             // We only need to know IF we have access, not what's shareable — and we never read
@@ -238,12 +253,11 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// `silent` mutes the watchdog's banner if no system audio arrives within the timeout —
-    /// used by the auto-restart path on `AVAudioEngineConfigurationChange` to honour the
-    /// "no error banner on device-change restart" contract. The watchdog STILL stops the
-    /// recording on trip; it just doesn't surface why. Sync failure paths in performStart
-    /// (mic denied, screen denied, buildSession throw) keep setting `lastError`; the caller
-    /// in `handleAudioConfigurationChange` wipes that synchronously after the await.
+    /// `silentWatchdog` mutes the 2-s "no system audio" watchdog banner — used by the auto-
+    /// restart path to honour the "no misleading error mid route-change" contract. The
+    /// watchdog still stops a session that never received SC audio; it just doesn't surface
+    /// why. Permanent failures from `buildSession` (screen permission revoked, no display)
+    /// stay visible via `lastError` so the user can act on them.
     @MainActor
     private func performStart(silentWatchdog: Bool = false) async {
         // Warm-start optimization: refresh mic synchronously (cheap), but only probe screen
@@ -262,11 +276,9 @@ final class AudioRecorder: NSObject, ObservableObject {
             let granted = await AVCaptureDevice.requestAccess(for: .audio)
             micPermission = granted ? .granted : .denied
         }
-        guard micPermission == .granted else {
-            lastError = "Microphone access is required to record audio."
-            state = .idle
-            return
-        }
+        // Mic is optional — denied permission just means the file holds system audio only;
+        // `buildSession` skips the mic-input wiring when `micPermission != .granted`. Screen
+        // recording remains the only mandatory permission (see `canStart`).
 
         if screenPermission == .notDetermined {
             UserDefaults.standard.set(true, forKey: Self.didRequestScreenRecordingKey)
@@ -281,15 +293,7 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
 
         do {
-            let newSession: RecordingSession
-            do {
-                newSession = try await buildSession(useVoiceProcessing: true)
-            } catch let error as NSError where error.code == -10875 {
-                // kAudioUnitErr_FailedInitialization — Voice Processing AU sometimes refuses to
-                // initialise on certain HAL input devices (BT HFP, some USB mics). Retry without
-                // AEC rather than blocking the recording entirely.
-                newSession = try await buildSession(useVoiceProcessing: false)
-            }
+            let newSession = try await buildSession()
             session = newSession
             installConfigChangeObserver(for: newSession.engine)
             startWatchdog(silent: silentWatchdog)
@@ -419,7 +423,7 @@ final class AudioRecorder: NSObject, ObservableObject {
     }
 
     @MainActor
-    private func buildSession(useVoiceProcessing: Bool) async throws -> RecordingSession {
+    private func buildSession() async throws -> RecordingSession {
         let directory = try directoryStore.ensureDirectoryExists()
         let fileURL = Self.uniqueFileURL(in: directory)
 
@@ -432,6 +436,15 @@ final class AudioRecorder: NSObject, ObservableObject {
         guard let display else { throw RecorderError.noDisplayAvailable }
         let filter = SCContentFilter(display: display, excludingWindows: [])
 
+        // Mic is wired whenever permission is granted. On built-in speakers anything the
+        // speakers play will bleed into the mic and end up in the file twice — once digitally
+        // via SCStream, once via the mic. We accept that trade-off rather than auto-muting:
+        // recording yourself talking on a silent system is a more common use case than
+        // transcribing system audio without headphones, and pre-muting the mic would silently
+        // drop the user's voice in the former case. Apple's VPIO (AEC) was tried and didn't
+        // help — it references the unit's own output path, not the system mixer's playback.
+        var micEnabled = micPermission == .granted
+
         let engine = AVAudioEngine()
         let playerNode = AVAudioPlayerNode()
         let customMixer = AVAudioMixerNode()
@@ -439,23 +452,16 @@ final class AudioRecorder: NSObject, ObservableObject {
         engine.attach(playerNode)
         engine.attach(customMixer)
 
-        // Voice Processing AU enables acoustic echo cancellation (the same unit FaceTime / Voice
-        // Memos use). Must be configured before connecting the input node. AGC is left off
-        // because a passive recording app shouldn't dynamically ride the mic level.
-        if useVoiceProcessing {
-            do {
-                try engine.inputNode.setVoiceProcessingEnabled(true)
-                engine.inputNode.isVoiceProcessingAGCEnabled = false
-            } catch {
-                // Recording still works without AEC.
+        if micEnabled {
+            let inputFormat = engine.inputNode.outputFormat(forBus: 0)
+            if inputFormat.sampleRate > 0, inputFormat.channelCount > 0 {
+                engine.connect(engine.inputNode, to: customMixer, format: inputFormat)
+            } else {
+                // BT HFP / flaky USB mics sometimes report a zero-channel input format.
+                // Degrade silently to system-audio-only rather than failing the whole session.
+                micEnabled = false
             }
         }
-
-        let inputFormat = engine.inputNode.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            throw RecorderError.invalidInputDevice
-        }
-        engine.connect(engine.inputNode, to: customMixer, format: inputFormat)
         engine.connect(playerNode, to: customMixer, format: Self.canonicalFormat)
         engine.connect(customMixer, to: engine.mainMixerNode, format: Self.canonicalFormat)
         engine.mainMixerNode.outputVolume = 0
@@ -608,9 +614,10 @@ final class AudioRecorder: NSObject, ObservableObject {
     /// `.recording` and use the normal Stop button.
     ///
     /// `lastError` is cleared before `performStart` so a stale message from earlier doesn't
-    /// linger. On `performStart` failure (mic permission revoked, no input device) the new
-    /// error stays put — permanent failures must be visible to the user. The previous
-    /// recording is finalized on disk either way.
+    /// linger. On `performStart` failure (screen permission revoked, no display, SC throw)
+    /// the new error stays put — permanent failures must remain visible. A revoked mic is
+    /// NOT a failure: `buildSession` just sets `micEnabled = false` and the session keeps
+    /// recording system audio. The previous file is finalized on disk regardless.
     ///
     /// Re-entrancy: `guard state == .recording` debounces stacked changes — any change firing
     /// while we're mid-restart is ignored; once we re-enter `.recording` a fresh change
@@ -846,13 +853,10 @@ private final class RecordingSession {
 }
 
 private enum RecorderError: LocalizedError {
-    case invalidInputDevice
     case noDisplayAvailable
 
     var errorDescription: String? {
         switch self {
-        case .invalidInputDevice:
-            return "No audio input device available."
         case .noDisplayAvailable:
             return "No display available for screen capture."
         }

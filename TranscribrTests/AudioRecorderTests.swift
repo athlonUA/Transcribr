@@ -392,6 +392,56 @@ final class AudioRecorderTests: XCTestCase {
         XCTAssertLessThan(plan.advanceSeconds, plan.chunkDurationSeconds)
     }
 
+    // MARK: - canStart (UI gating policy)
+
+    @MainActor
+    func test_canStart_isTrue_onIdleAndScreenGranted_evenIfMicDenied() {
+        // Mic is optional — recordings can be system-audio-only. The Start button must
+        // remain reachable when only screen recording is granted.
+        let recorder = makeRecorderWithPermissions(mic: .denied, screen: .granted)
+        XCTAssertTrue(recorder.canStart,
+                      "denied mic must not block the Start button; system audio is the floor")
+    }
+
+    @MainActor
+    func test_canStart_isTrue_onIdleAndScreenGrantedAndMicGranted() {
+        let recorder = makeRecorderWithPermissions(mic: .granted, screen: .granted)
+        XCTAssertTrue(recorder.canStart)
+    }
+
+    @MainActor
+    func test_canStart_isTrue_onIdleAndScreenGrantedAndMicUndetermined() {
+        let recorder = makeRecorderWithPermissions(mic: .undetermined, screen: .granted)
+        XCTAssertTrue(recorder.canStart, "undetermined mic must not block Start either")
+    }
+
+    @MainActor
+    func test_canStart_isFalse_whenScreenNotGranted() {
+        // Screen Recording is the only mandatory permission — without it we can't capture
+        // system audio at all, leaving nothing to record.
+        for screen in [ScreenCapturePermission.denied, .notDetermined] {
+            let recorder = makeRecorderWithPermissions(mic: .granted, screen: screen)
+            XCTAssertFalse(recorder.canStart,
+                           "Start must be blocked when screen permission is \(screen)")
+        }
+    }
+
+    /// Builds an `AudioRecorder` whose published `micPermission` / `screenPermission` match the
+    /// requested values. The initializer reads the actual system state, so we override after
+    /// construction via the private setter the published properties expose.
+    @MainActor
+    private func makeRecorderWithPermissions(
+        mic: MicrophonePermission,
+        screen: ScreenCapturePermission
+    ) -> AudioRecorder {
+        let recorder = AudioRecorder(
+            directoryStore: RecordsDirectoryStore(),
+            settingsStore: SettingsStore()
+        )
+        recorder.overridePermissionsForTesting(mic: mic, screen: screen)
+        return recorder
+    }
+
     // MARK: - shouldStartAfterRestart (auto-restart decision)
 
     func test_shouldStartAfterRestart_proceedsOnlyWhenIdleAndNotCancelled() {

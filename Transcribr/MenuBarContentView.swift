@@ -168,9 +168,11 @@ struct MenuBarContentView: View {
     private var permissionsBanner: some View {
         VStack(alignment: .leading, spacing: 6) {
             if recorder.micPermission == .denied {
+                // Informational only — recordings still work, but skip the voice track.
+                // Screen Recording remains the only blocking permission (see canStart).
                 permissionBanner(
                     title: "Microphone access denied",
-                    detail: "Required to capture your voice. Toggle on in System Settings and reopen this popover.",
+                    detail: "Recordings will capture system audio only. Grant access in System Settings to include your voice.",
                     actions: [
                         .init(label: "Open System Settings", action: {
                             openURL("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
