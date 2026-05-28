@@ -259,6 +259,139 @@ final class AudioRecorderTests: XCTestCase {
         XCTAssertEqual(second?.inputFormat.sampleRate, 16_000)
     }
 
+    // MARK: - MultipartFilename
+
+    func test_multipartFilename_passesThroughNormal() {
+        XCTAssertEqual(MultipartFilename.sanitize("recording-2026-05-28.m4a"), "recording-2026-05-28.m4a")
+    }
+
+    func test_multipartFilename_stripsCRLF() {
+        XCTAssertEqual(MultipartFilename.sanitize("bad\rname\n.m4a"), "badname.m4a")
+    }
+
+    func test_multipartFilename_replacesQuoteWithUnderscore() {
+        XCTAssertEqual(MultipartFilename.sanitize("with\"quote.m4a"), "with_quote.m4a")
+    }
+
+    func test_multipartFilename_combinesAllCases() {
+        XCTAssertEqual(
+            MultipartFilename.sanitize("\"weird\rname\n.m4a"),
+            "_weirdname.m4a"
+        )
+    }
+
+    // MARK: - EnvLoader.parseValue
+
+    func test_envLoader_parsesSimpleKeyValue() throws {
+        let path = try writeTempEnv("OPENAI_API_KEY=sk-abc\n")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        XCTAssertEqual(EnvLoader.parseValue(forKey: "OPENAI_API_KEY", path: path), "sk-abc")
+    }
+
+    func test_envLoader_stripsCarriageReturnFromCRLFFile() throws {
+        // Windows-edited .env files use CRLF. A trailing `\r` silently smuggled into the
+        // API key would cause OpenAI auth to fail with no obvious user-facing cause.
+        let path = try writeTempEnv("OPENAI_API_KEY=sk-abc\r\n")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        XCTAssertEqual(EnvLoader.parseValue(forKey: "OPENAI_API_KEY", path: path), "sk-abc")
+    }
+
+    func test_envLoader_handlesDoubleQuotedValue() throws {
+        let path = try writeTempEnv("KEY=\"value with spaces\"\n")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        XCTAssertEqual(EnvLoader.parseValue(forKey: "KEY", path: path), "value with spaces")
+    }
+
+    func test_envLoader_handlesSingleQuotedValue() throws {
+        let path = try writeTempEnv("KEY='value'\n")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        XCTAssertEqual(EnvLoader.parseValue(forKey: "KEY", path: path), "value")
+    }
+
+    func test_envLoader_skipsCommentsAndBlanks() throws {
+        let path = try writeTempEnv("""
+        # this is a comment
+
+        KEY=value
+
+        # another comment
+        OTHER=ignored
+        """)
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        XCTAssertEqual(EnvLoader.parseValue(forKey: "KEY", path: path), "value")
+    }
+
+    func test_envLoader_returnsNilForMissingKey() throws {
+        let path = try writeTempEnv("OTHER=value\n")
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        XCTAssertNil(EnvLoader.parseValue(forKey: "MISSING", path: path))
+    }
+
+    func test_envLoader_returnsNilForMissingFile() {
+        XCTAssertNil(EnvLoader.parseValue(forKey: "ANY", path: "/nonexistent/.env"))
+    }
+
+    private func writeTempEnv(_ content: String) throws -> String {
+        let path = NSTemporaryDirectory() + "envloader-test-\(UUID().uuidString).env"
+        try content.write(toFile: path, atomically: true, encoding: .utf8)
+        return path
+    }
+
+    // MARK: - ChunkPlanner
+
+    func test_chunkPlan_aacUsesSizeBasedWhenUnderDurationCap() {
+        // 22 MB exactly worth of bytes at 22 KB/s → sizeBased = 1000 s, under 1200 cap.
+        let plan = ChunkPlanner.plan(
+            totalBytes: 22 * 1024 * 1024,
+            totalSeconds: 1000,
+            useReencode: false
+        )
+        XCTAssertEqual(plan.chunkDurationSeconds, 1000, accuracy: 1)
+        XCTAssertEqual(plan.advanceSeconds, 997, accuracy: 1)
+    }
+
+    func test_chunkPlan_aacCapsAtDurationLimitForLowBitrate() {
+        // 81.8 MB, 113 min @ ~96 kbps — the production case that surfaced the 1400 s cap.
+        // bytesPerSecond ≈ 12651, sizeBased ≈ 1823 s, but capped at 1200.
+        let plan = ChunkPlanner.plan(
+            totalBytes: 81 * 1024 * 1024 + 8 * 100 * 1024,
+            totalSeconds: 113 * 60,
+            useReencode: false
+        )
+        XCTAssertEqual(plan.chunkDurationSeconds, 1200, accuracy: 1)
+        XCTAssertEqual(plan.advanceSeconds, 1197, accuracy: 1)
+    }
+
+    func test_chunkPlan_reencodeUsesFixedShorterTarget() {
+        // useReencode = true → always reencodeChunkTargetSeconds, regardless of input math.
+        let plan = ChunkPlanner.plan(
+            totalBytes: 100 * 1024 * 1024,
+            totalSeconds: 6000,
+            useReencode: true
+        )
+        XCTAssertEqual(plan.chunkDurationSeconds, 600, accuracy: 1)
+        XCTAssertEqual(plan.advanceSeconds, 597, accuracy: 1)
+    }
+
+    func test_chunkPlan_handlesZeroDurationByFallingBackToCap() {
+        let plan = ChunkPlanner.plan(
+            totalBytes: 0,
+            totalSeconds: 0,
+            useReencode: false
+        )
+        XCTAssertEqual(plan.chunkDurationSeconds, 1200, accuracy: 1)
+    }
+
+    func test_chunkPlan_advanceIsPositive() {
+        let plan = ChunkPlanner.plan(
+            totalBytes: 22 * 1024 * 1024,
+            totalSeconds: 1200,
+            useReencode: false
+        )
+        XCTAssertGreaterThan(plan.advanceSeconds, 0)
+        XCTAssertLessThan(plan.advanceSeconds, plan.chunkDurationSeconds)
+    }
+
     // MARK: - CMSampleBuffer helper
 
     /// Builds a Float32 PCM CMSampleBuffer for tests.

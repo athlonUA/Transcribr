@@ -33,19 +33,9 @@ struct TranscribrApp: App {
     }
 }
 
-/// Custom 5-bar waveform icon used everywhere in the UI — both as the menu bar tray icon and in
-/// the popover header — so the visual stays consistent.
-///
-///   - Idle:      five rounded vertical bars with a symmetric short-tall-tallest-tall-short
-///                pattern, mimicking SF Symbol `waveform` proportions. Static.
-///   - Animating: each bar pulses gently around its base height (75–100%) with a phase offset
-///                between bars, giving a slow travelling-wave effect. Driven by a shared
-///                `Timer.publish` at 12 fps; `@State` bumps on each tick, body re-renders a fresh
-///                `NSImage` with `cacheMode = .never`.
-///
-/// The body always returns a single `Image` (no `TimelineView` wrapper) — that's important
-/// because `MenuBarExtra` rasterises the label to `NSStatusItem.button.image`, and a non-`Image`
-/// label sometimes breaks the popover click target.
+/// The body must return a single `Image` — `MenuBarExtra` rasterises the label to
+/// `NSStatusItem.button.image`, and wrapping the image in a `TimelineView` or other container
+/// breaks the popover click target on some macOS versions.
 struct WaveformBarsIcon: View {
     let isAnimating: Bool
     @State private var tick: UInt64 = 0
@@ -68,10 +58,8 @@ struct WaveformBarsIcon: View {
     private static let barWidth: CGFloat = 2.0
     private static let barSpacing: CGFloat = 1.5
     private static let totalHeight: CGFloat = 14
-    /// Symmetric "tall-in-the-middle" pattern matching SF Symbol `waveform` proportions.
     private static let baseBarHeights: [CGFloat] = [4, 8, 12, 8, 4]
     private static let cyclesPerSecond: Double = 0.7
-    /// Subtle pulse: each bar swings between 75% and 100% of its base height.
     private static let pulseMin: Double = 0.75
     private static let pulseRange: Double = 0.25
 
@@ -97,7 +85,7 @@ struct WaveformBarsIcon: View {
         let size = NSSize(width: totalWidth, height: totalHeight)
 
         let img = NSImage(size: size, flipped: false) { _ in
-            NSColor.black.setFill() // template — re-tinted by the menu bar / surrounding view.
+            NSColor.black.setFill()
             for i in 0..<barCount {
                 let phase = Double(i) * 0.9
                 let normalized = (sin(t + phase) + 1.0) / 2.0

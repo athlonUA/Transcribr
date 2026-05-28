@@ -31,6 +31,11 @@ enum TranscriptionState: Equatable {
     case failed(String)
 }
 
+struct TranscriptionProgress: Equatable {
+    let current: Int
+    let total: Int
+}
+
 enum TranscriptionModel: String, CaseIterable, Identifiable {
     case whisper1 = "whisper-1"
     case gpt4oMiniTranscribe = "gpt-4o-mini-transcribe"
@@ -47,20 +52,12 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
     }
 }
 
-/// Persists the OpenAI API key and the chosen transcription model in `UserDefaults`. On first
-/// launch, if `UserDefaults` is empty and an `.env` with `OPENAI_API_KEY` exists at one of the
-/// known locations, the key is migrated into `UserDefaults` so the user doesn't have to re-enter
-/// it. After that the `.env` is no longer consulted — the popover's settings section is the
-/// single source of truth.
-///
-/// `UserDefaults` is plaintext on disk under `~/Library/Preferences/`. That's adequate for a
-/// local development app; a shipped product should migrate this storage to Keychain.
+/// `UserDefaults` is plaintext on disk; a shipped product should migrate the API key to Keychain.
 final class SettingsStore: ObservableObject {
     static let apiKeyDefaultsKey = "transcribr.openAIAPIKey"
     static let modelDefaultsKey = "transcribr.transcriptionModel"
-    /// One-shot flag — set to `true` after a successful `.env` → `UserDefaults` migration so the
-    /// migration never re-runs. Without this, clearing the API key from the popover would be
-    /// undone on next launch as long as `.env` still exists.
+    /// Without this flag, clearing the API key from the popover would be silently undone on
+    /// the next launch as long as `.env` still exists.
     static let envMigrationDoneKey = "transcribr.envMigrationDone"
 
     @Published var apiKey: String {
@@ -83,10 +80,7 @@ final class SettingsStore: ObservableObject {
         } else {
             self.apiKey = ""
         }
-        // Mark migration done in every init path so `.env` is never re-consulted after the
-        // first launch — including the branch where UserDefaults already holds a key. Without
-        // this, a user who clears the key in the popover and then restarts could see `.env`
-        // silently re-import the old value.
+        // Marked unconditionally so a later popover-clear sticks regardless of which branch above ran.
         UserDefaults.standard.set(true, forKey: Self.envMigrationDoneKey)
 
         let rawModel = UserDefaults.standard.string(forKey: Self.modelDefaultsKey)
@@ -114,12 +108,16 @@ final class AudioRecorder: NSObject, ObservableObject {
     @Published private(set) var recordingStartedAt: Date?
     @Published private(set) var state: RecorderState = .idle
     @Published private(set) var transcriptionState: TranscriptionState = .idle
+    @Published private(set) var transcriptionProgress: TranscriptionProgress?
 
     private let directoryStore: RecordsDirectoryStore
     private let settingsStore: SettingsStore
     private var session: RecordingSession?
     private var watchdogTask: Task<Void, Never>?
     private var configChangeObserver: NSObjectProtocol?
+    /// MainActor-isolated. Persisted to disk + clipboard after every chunk so a crash mid-run
+    /// leaves the in-progress transcript already saved.
+    private var currentAccumulatedText: String = ""
 
     var canStart: Bool {
         state == .idle && micPermission != .denied && screenPermission == .granted
@@ -129,10 +127,8 @@ final class AudioRecorder: NSObject, ObservableObject {
         self.directoryStore = directoryStore
         self.settingsStore = settingsStore
         self.micPermission = AudioRecorder.mapMicStatus(AVCaptureDevice.authorizationStatus(for: .audio))
-        // Fast hint at init only. `CGPreflightScreenCaptureAccess()` is known to return false
-        // even when the user has granted Screen Recording in System Settings — the reliable
-        // check is `SCShareableContent` which we run from `refreshPermissions()` on first
-        // popover open and at every Start.
+        // Fast hint only — `CGPreflightScreenCaptureAccess()` lies in both directions; the
+        // authoritative probe via `SCShareableContent` runs from `refreshPermissions()`.
         self.screenPermission = CGPreflightScreenCaptureAccess() ? .granted : .notDetermined
         super.init()
     }
@@ -250,13 +246,25 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
 
         do {
-            let newSession = try await buildSession()
+            let newSession: RecordingSession
+            do {
+                newSession = try await buildSession(useVoiceProcessing: true)
+            } catch let error as NSError where error.code == -10875 {
+                // kAudioUnitErr_FailedInitialization — Voice Processing AU sometimes refuses to
+                // initialise on certain HAL input devices (BT HFP, some USB mics). Retry without
+                // AEC rather than blocking the recording entirely.
+                newSession = try await buildSession(useVoiceProcessing: false)
+            }
             session = newSession
             installConfigChangeObserver(for: newSession.engine)
             startWatchdog()
             currentURL = newSession.fileURL
             recordingStartedAt = Date()
-            transcriptionState = .idle
+            // Don't clobber a still-running transcription from a prior recording.
+            if transcriptionState != .transcribing {
+                transcriptionState = .idle
+                transcriptionProgress = nil
+            }
             isRecording = true
             state = .recording
         } catch {
@@ -267,7 +275,6 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     @MainActor
     private func performStop() async {
-        // state is already .stopping (set synchronously by `stop()` / event handlers).
         watchdogTask?.cancel()
         watchdogTask = nil
         removeConfigChangeObserver()
@@ -288,10 +295,17 @@ final class AudioRecorder: NSObject, ObservableObject {
         state = .idle
     }
 
-    /// Public entry point — UI invokes this when the user clicks "Transcribe Last Recording" or
-    /// "Choose File…". Transcription is no longer auto-started after stop.
+    /// Validates the API key BEFORE flipping to `.transcribing` so a missing-key tap goes
+    /// straight to `.failed` without the popover briefly flashing the spinner.
     @MainActor
     func transcribe(audioURL: URL) {
+        guard transcriptionState != .transcribing else { return }
+        guard !settingsStore.apiKey.isEmpty else {
+            transcriptionState = .failed("OpenAI API key is not set. Open Transcription Settings in the popover and paste your key.")
+            return
+        }
+        transcriptionState = .transcribing
+        transcriptionProgress = nil
         Task { @MainActor [weak self] in
             await self?.runTranscription(audioURL: audioURL)
         }
@@ -300,41 +314,68 @@ final class AudioRecorder: NSObject, ObservableObject {
     @MainActor
     private func runTranscription(audioURL: URL) async {
         let apiKey = settingsStore.apiKey
-        guard !apiKey.isEmpty else {
-            transcriptionState = .failed("OpenAI API key is not set. Open Transcription Settings in the popover and paste your key.")
-            return
-        }
-
-        transcriptionState = .transcribing
+        let txtURL = audioURL.deletingPathExtension().appendingPathExtension("txt")
+        // Don't pre-delete `txtURL` — if the very first chunk fails we want any prior
+        // `.txt` from an earlier successful run on the same audio to stay intact.
+        currentAccumulatedText = ""
 
         do {
             let service = TranscriptionService(
                 apiKey: apiKey,
                 model: settingsStore.transcriptionModel.rawValue
             )
-            let text = try await service.transcribe(audioFile: audioURL)
-            let txtURL = audioURL.deletingPathExtension().appendingPathExtension("txt")
-            try text.write(to: txtURL, atomically: true, encoding: .utf8)
-
-            // Auto-copy the transcript to the clipboard so the user can paste immediately.
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(text, forType: .string)
-
+            _ = try await service.transcribe(
+                audioFile: audioURL,
+                progress: { [weak self] current, total in
+                    Task { @MainActor [weak self] in
+                        self?.transcriptionProgress = TranscriptionProgress(current: current, total: total)
+                    }
+                },
+                onChunkText: { [weak self] chunkText in
+                    Task { @MainActor [weak self] in
+                        self?.appendChunkText(chunkText, txtURL: txtURL)
+                    }
+                }
+            )
+            // Every chunk has already been written + clipboard'd via `onChunkText`.
+            transcriptionProgress = nil
             transcriptionState = .completed(txtURL)
+        } catch let TranscriptionError.partialFailure(_, completed, total, underlying) {
+            transcriptionProgress = nil
+            if currentAccumulatedText.isEmpty {
+                transcriptionState = .failed("Transcription failed on first chunk: \(underlying.localizedDescription)")
+            } else {
+                let annotation = "\n\n[Transcription stopped after chunk \(completed) of \(total): \(underlying.localizedDescription)]"
+                try? (currentAccumulatedText + annotation).write(to: txtURL, atomically: true, encoding: .utf8)
+                transcriptionState = .failed("Got \(completed) of \(total) chunks before \(underlying.localizedDescription). Partial transcript saved to \(txtURL.lastPathComponent) and copied to clipboard.")
+            }
         } catch {
+            transcriptionProgress = nil
             transcriptionState = .failed("Transcription failed: \(error.localizedDescription)")
         }
     }
 
     @MainActor
-    private func buildSession() async throws -> RecordingSession {
+    private func appendChunkText(_ text: String, txtURL: URL) {
+        if !currentAccumulatedText.isEmpty {
+            currentAccumulatedText += " "
+        }
+        currentAccumulatedText += text
+
+        try? currentAccumulatedText.write(to: txtURL, atomically: true, encoding: .utf8)
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(currentAccumulatedText, forType: .string)
+    }
+
+    @MainActor
+    private func buildSession(useVoiceProcessing: Bool) async throws -> RecordingSession {
         let directory = try directoryStore.ensureDirectoryExists()
         let fileURL = Self.uniqueFileURL(in: directory)
 
-        // Probe screen recording permission (and resolve the display filter) before allocating
-        // any audio resources. If permission is missing this throws cleanly with nothing to
-        // clean up.
+        // Probe screen permission before allocating any audio resources so a missing-permission
+        // throw doesn't leak a half-built engine.
         let scContent = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         let display = scContent.displays.first(where: { $0.displayID == CGMainDisplayID() })
             ?? scContent.displays.first
@@ -347,6 +388,18 @@ final class AudioRecorder: NSObject, ObservableObject {
 
         engine.attach(playerNode)
         engine.attach(customMixer)
+
+        // Voice Processing AU enables acoustic echo cancellation (the same unit FaceTime / Voice
+        // Memos use). Must be configured before connecting the input node. AGC is left off
+        // because a passive recording app shouldn't dynamically ride the mic level.
+        if useVoiceProcessing {
+            do {
+                try engine.inputNode.setVoiceProcessingEnabled(true)
+                engine.inputNode.isVoiceProcessingAGCEnabled = false
+            } catch {
+                // Recording still works without AEC.
+            }
+        }
 
         let inputFormat = engine.inputNode.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
@@ -406,8 +459,8 @@ final class AudioRecorder: NSObject, ObservableObject {
         try scStream.addStreamOutput(scOutput, type: .audio, sampleHandlerQueue: session.sampleQueue)
         try scStream.addStreamOutput(scOutput, type: .screen, sampleHandlerQueue: session.sampleQueue)
 
-        // Now actually start engine + stream. Anything that throws past this point must
-        // clean up local resources (file, tap, engine) so we never leak a zero-byte .m4a.
+        // Anything that throws past this point must clean up local resources so we never leak
+        // a zero-byte `.m4a` on disk.
         do {
             engine.prepare()
             try engine.start()
@@ -440,7 +493,6 @@ final class AudioRecorder: NSObject, ObservableObject {
                 return candidate
             }
         }
-        // Pathological fallback: append UUID prefix.
         return directory.appendingPathComponent("\(stem)-\(UUID().uuidString).\(ext)")
     }
 
@@ -629,8 +681,7 @@ private final class RecordingSession {
             converter: &converter
         ) else { return }
 
-        // Backpressure: if the player's internal buffer queue is too deep (slow consumer or
-        // engine stall), drop further samples rather than grow memory unbounded.
+        // Drop samples rather than grow memory unbounded if the player queue backs up.
         let current = pendingPlayerBuffers.withLock { $0 }
         if current >= maxPendingPlayerBuffers {
             return
@@ -722,17 +773,6 @@ private final class ScreenCaptureDelegate: NSObject, SCStreamDelegate {
     }
 }
 
-// MARK: - .env loader
-//
-// Resolves `OPENAI_API_KEY` from, in priority order:
-//   1. Process env var (set via Xcode scheme or shell when launching from terminal).
-//   2. ~/.transcribr/.env
-//   3. ~/Documents/<records-dir>/.env  (where the user keeps recordings)
-//   4. /Users/<current-user>/Projects/Transcribr/.env (development convenience).
-//
-// In a shipped app this should be replaced with Keychain — `.env` lookups are a dev-only
-// affordance and live outside the app bundle so the key is never embedded in the binary.
-
 enum EnvLoader {
     static func loadOpenAIKey() -> String? {
         if let key = ProcessInfo.processInfo.environment["OPENAI_API_KEY"], !key.isEmpty {
@@ -747,9 +787,8 @@ enum EnvLoader {
             documents + "/Transcribr/.env",
         ]
         #if DEBUG
-        // Development convenience: pick up the project-root .env when the app is launched
-        // from Xcode's DerivedData. Stripped from Release builds so a shipped binary can't
-        // be tricked into reading arbitrary user-home paths.
+        // Stripped from Release so a shipped binary can't be coaxed into reading arbitrary
+        // user-home paths.
         candidates.append(home + "/Projects/Transcribr/.env")
         #endif
         for path in candidates {
@@ -764,13 +803,15 @@ enum EnvLoader {
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
             return nil
         }
+        // `.whitespacesAndNewlines` strips the trailing `\r` from CRLF-terminated files;
+        // plain `.whitespaces` would smuggle the `\r` into the API key.
         for rawLine in content.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix("#") { continue }
             let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
             guard parts.count == 2,
-                  parts[0].trimmingCharacters(in: .whitespaces) == key else { continue }
-            var value = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                  parts[0].trimmingCharacters(in: .whitespacesAndNewlines) == key else { continue }
+            var value = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
             if (value.hasPrefix("\"") && value.hasSuffix("\"")) ||
                (value.hasPrefix("'") && value.hasSuffix("'")) {
                 value = String(value.dropFirst().dropLast())
@@ -781,11 +822,68 @@ enum EnvLoader {
     }
 }
 
-// MARK: - OpenAI Whisper transcription
+enum MultipartFilename {
+    /// CR/LF would split the multipart header and inject arbitrary form-data parts; `"`
+    /// would close the quoted-string parameter early.
+    static func sanitize(_ name: String) -> String {
+        name
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\"", with: "_")
+    }
+}
+
+/// Pure chunk-duration math, separated from `TranscriptionService.splitIntoChunks` so it can
+/// be unit-tested without `AVAssetExportSession`.
+enum ChunkPlanner {
+    struct Plan: Equatable {
+        let chunkDurationSeconds: Double
+        let overlapSeconds: Double
+        var advanceSeconds: Double { chunkDurationSeconds - overlapSeconds }
+    }
+
+    /// Passthrough takes `min(bytes-budget seconds, duration cap)`. Re-encode uses a fixed
+    /// shorter target since the AppleM4A preset's bitrate is independent of the source.
+    static func plan(
+        totalBytes: Int,
+        totalSeconds: Double,
+        useReencode: Bool,
+        chunkTargetBytes: Int = 22 * 1024 * 1024,
+        chunkTargetSeconds: Double = 1200,
+        reencodeChunkTargetSeconds: Double = 600,
+        overlapSeconds: Double = 3.0
+    ) -> Plan {
+        let chunkSec: Double
+        if useReencode {
+            chunkSec = reencodeChunkTargetSeconds
+        } else if totalSeconds > 0, totalBytes > 0 {
+            let bytesPerSecond = Double(totalBytes) / totalSeconds
+            let sizeBased = Double(chunkTargetBytes) / bytesPerSecond
+            chunkSec = min(sizeBased, chunkTargetSeconds)
+        } else {
+            chunkSec = chunkTargetSeconds
+        }
+        return Plan(chunkDurationSeconds: chunkSec, overlapSeconds: overlapSeconds)
+    }
+}
 
 private final class TranscriptionService {
-    /// OpenAI's documented hard limit on the `/v1/audio/transcriptions` upload.
+    /// OpenAI's hard upload cap.
     static let maxFileSizeBytes: Int = 25 * 1024 * 1024
+    /// 3 MB margin under the 25 MB cap because AAC frame alignment makes the per-chunk byte
+    /// count unpredictable from a duration estimate.
+    static let chunkTargetBytes: Int = 22 * 1024 * 1024
+    /// GPT-4o transcription models cap each request at 1400 audio-seconds (~23 min); Whisper-1
+    /// has no documented cap but we apply this uniformly.
+    static let maxRequestSeconds: Double = 1400
+    static let chunkTargetSeconds: Double = 1200
+    /// Overlap between adjacent chunks. AAC frame-aligned passthrough cuts at sample
+    /// boundaries — without overlap, a word straddling the boundary gets sliced and Whisper
+    /// drops it from both sides. Mild text duplication around the boundary is the trade-off.
+    static let chunkOverlapSeconds: Double = 3.0
+    /// AppleM4A re-encode runs at a higher bitrate than typical source recordings, so the
+    /// re-encode path uses a shorter chunk to stay under 25 MB.
+    static let reencodeChunkTargetSeconds: Double = 600
 
     private let apiKey: String
     private let model: String
@@ -801,16 +899,91 @@ private final class TranscriptionService {
         self.session = URLSession(configuration: config)
     }
 
-    func transcribe(audioFile: URL) async throws -> String {
+    /// `onChunkText` fires once per chunk (and once for single-shot) so the caller can persist
+    /// transcripts incrementally — a crash mid-run leaves everything completed so far on disk.
+    /// If a chunk upload fails, `TranscriptionError.partialFailure` is thrown; the caller has
+    /// already received every completed chunk's text via `onChunkText` by then.
+    func transcribe(
+        audioFile: URL,
+        progress: @escaping (Int, Int) -> Void,
+        onChunkText: @escaping (String) -> Void
+    ) async throws -> String {
         let attrs = try FileManager.default.attributesOfItem(atPath: audioFile.path)
         let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
-        guard size <= Self.maxFileSizeBytes else {
-            throw TranscriptionError.fileTooLarge(sizeBytes: size, limitBytes: Self.maxFileSizeBytes)
+
+        let asset = AVURLAsset(url: audioFile)
+        let totalDuration = try await asset.load(.duration)
+        let totalSeconds = CMTimeGetSeconds(totalDuration)
+
+        let sizeFits = size <= Self.maxFileSizeBytes
+        let durationFits = totalSeconds.isFinite && totalSeconds <= Self.maxRequestSeconds
+
+        if sizeFits && durationFits {
+            progress(1, 1)
+            let text = try await uploadAudioFile(audioFile)
+            onChunkText(text)
+            return text
         }
 
+        let useReencode = try await !Self.isAACSource(asset)
+        let chunkURLs = try await splitIntoChunks(
+            sourceFile: audioFile,
+            asset: asset,
+            totalDuration: totalDuration,
+            useReencode: useReencode
+        )
+        defer {
+            for url in chunkURLs {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+
+        guard !chunkURLs.isEmpty else {
+            throw TranscriptionError.chunkingFailed("Chunking produced no segments.")
+        }
+
+        var transcripts: [String] = []
+        for (idx, chunkURL) in chunkURLs.enumerated() {
+            progress(idx + 1, chunkURLs.count)
+            do {
+                let text = try await uploadAudioFile(chunkURL)
+                transcripts.append(text)
+                onChunkText(text)
+            } catch {
+                let partial = transcripts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                throw TranscriptionError.partialFailure(
+                    partialText: partial,
+                    completedChunks: idx,
+                    totalChunks: chunkURLs.count,
+                    underlying: error
+                )
+            }
+        }
+        return transcripts.joined(separator: " ")
+    }
+
+    /// Heuristic codec detection — reads the first audio track's `formatDescriptions` and
+    /// returns `true` iff the codec is MPEG-4 AAC. The fast happy path: anything we record
+    /// ourselves is AAC, so passthrough is selected.
+    private static func isAACSource(_ asset: AVURLAsset) async throws -> Bool {
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let track = tracks.first else { return false }
+        let formats = try await track.load(.formatDescriptions)
+        for fd in formats {
+            let cmFormat = fd
+            if let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(cmFormat) {
+                if asbdPointer.pointee.mFormatID == kAudioFormatMPEG4AAC {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private func uploadAudioFile(_ audioFile: URL) async throws -> String {
         let audioData = try Data(contentsOf: audioFile)
         let boundary = "Boundary-\(UUID().uuidString)"
-        let safeFilename = Self.sanitizeMultipartFilename(audioFile.lastPathComponent)
+        let safeFilename = MultipartFilename.sanitize(audioFile.lastPathComponent)
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -843,20 +1016,137 @@ private final class TranscriptionService {
         return decoded.text
     }
 
-    /// Strips characters that would break the `filename="..."` token of the multipart body:
-    /// CR/LF (would split the header), `"` (closes the quoted-string early).
-    static func sanitizeMultipartFilename(_ name: String) -> String {
-        name
-            .replacingOccurrences(of: "\r", with: "")
-            .replacingOccurrences(of: "\n", with: "")
-            .replacingOccurrences(of: "\"", with: "_")
+    /// Splits `sourceFile` into N temporary `.m4a` chunks. Two paths:
+    ///
+    /// - **Passthrough** (`useReencode = false`, default for AAC sources): `AVAssetExport`
+    ///   copies AAC frames byte-for-byte. Chunk length picked from both the bytes-per-second
+    ///   estimate and the GPT-4o 1400 s duration cap, whichever is shorter.
+    /// - **Re-encode** (`useReencode = true`, for `.wav` / `.mp3` and other non-AAC sources):
+    ///   `AVAssetExportPresetAppleM4A` transcodes to AAC; chunks shortened to
+    ///   `reencodeChunkTargetSeconds` so the higher re-encode bitrate doesn't overshoot 25 MB.
+    ///
+    /// Adjacent chunks **overlap** by `chunkOverlapSeconds` so words spanning a sample-aligned
+    /// cut survive in at least one chunk. Slight text duplication around the boundary is the
+    /// trade-off and is acceptable for voice transcripts.
+    private func splitIntoChunks(
+        sourceFile: URL,
+        asset: AVURLAsset,
+        totalDuration: CMTime,
+        useReencode: Bool
+    ) async throws -> [URL] {
+        let attrs = try FileManager.default.attributesOfItem(atPath: sourceFile.path)
+        let totalBytes = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        let totalSeconds = CMTimeGetSeconds(totalDuration)
+
+        guard totalSeconds.isFinite, totalSeconds > 0, totalBytes > 0 else {
+            throw TranscriptionError.chunkingFailed("Could not read duration or size of the audio file.")
+        }
+
+        let plan = ChunkPlanner.plan(
+            totalBytes: totalBytes,
+            totalSeconds: totalSeconds,
+            useReencode: useReencode,
+            chunkTargetBytes: Self.chunkTargetBytes,
+            chunkTargetSeconds: Self.chunkTargetSeconds,
+            reencodeChunkTargetSeconds: Self.reencodeChunkTargetSeconds,
+            overlapSeconds: Self.chunkOverlapSeconds
+        )
+        let chunkDuration = CMTime(seconds: plan.chunkDurationSeconds, preferredTimescale: 600)
+        let overlap = CMTime(seconds: plan.overlapSeconds, preferredTimescale: 600)
+
+        guard CMTimeCompare(chunkDuration, overlap) > 0 else {
+            throw TranscriptionError.chunkingFailed("Computed chunk duration (\(plan.chunkDurationSeconds)s) is not larger than the overlap window (\(plan.overlapSeconds)s); cannot make forward progress.")
+        }
+
+        let preset = useReencode ? AVAssetExportPresetAppleM4A : AVAssetExportPresetPassthrough
+        var urls: [URL] = []
+        var startTime = CMTime.zero
+
+        do {
+            while CMTimeCompare(startTime, totalDuration) < 0 {
+                let remaining = CMTimeSubtract(totalDuration, startTime)
+                let thisChunkDuration = CMTimeCompare(remaining, chunkDuration) < 0 ? remaining : chunkDuration
+
+                guard CMTimeCompare(thisChunkDuration, .zero) > 0 else {
+                    throw TranscriptionError.chunkingFailed("Chunk duration collapsed to zero mid-loop.")
+                }
+
+                let tempURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("transcribr-chunk-\(UUID().uuidString).m4a")
+
+                try await exportChunk(
+                    asset: asset,
+                    timeRange: CMTimeRange(start: startTime, duration: thisChunkDuration),
+                    to: tempURL,
+                    preset: preset
+                )
+                urls.append(tempURL)
+
+                // Non-last chunks back up by `overlap` so the next chunk's start sits in the
+                // previous chunk's tail. The last chunk has no "next" to overlap with.
+                let advance: CMTime
+                if CMTimeCompare(remaining, chunkDuration) < 0 {
+                    advance = thisChunkDuration
+                } else {
+                    advance = CMTimeSubtract(thisChunkDuration, overlap)
+                }
+                guard CMTimeCompare(advance, .zero) > 0 else {
+                    throw TranscriptionError.chunkingFailed("Chunk advance step was zero; refusing to loop forever.")
+                }
+                startTime = CMTimeAdd(startTime, advance)
+            }
+        } catch {
+            for url in urls {
+                try? FileManager.default.removeItem(at: url)
+            }
+            throw error
+        }
+
+        return urls
     }
+
+    private func exportChunk(
+        asset: AVAsset,
+        timeRange: CMTimeRange,
+        to outputURL: URL,
+        preset: String
+    ) async throws {
+        // AVAssetExportSession refuses to overwrite, and a stale file from a killed previous
+        // run could theoretically sit at the UUID path.
+        try? FileManager.default.removeItem(at: outputURL)
+
+        guard let exportSession = AVAssetExportSession(asset: asset, presetName: preset) else {
+            throw TranscriptionError.chunkingFailed("AVAssetExportSession unavailable for preset \(preset).")
+        }
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = .m4a
+        exportSession.timeRange = timeRange
+
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            exportSession.exportAsynchronously {
+                switch exportSession.status {
+                case .completed:
+                    cont.resume(returning: ())
+                case .failed:
+                    cont.resume(throwing: exportSession.error
+                        ?? TranscriptionError.chunkingFailed("Export session failed without an underlying error."))
+                case .cancelled:
+                    cont.resume(throwing: TranscriptionError.chunkingFailed("Export cancelled."))
+                default:
+                    cont.resume(throwing: TranscriptionError.chunkingFailed("Export ended in unexpected state \(exportSession.status.rawValue)."))
+                }
+            }
+        }
+    }
+
 }
 
 private enum TranscriptionError: LocalizedError {
     case invalidResponse
     case serverError(statusCode: Int, body: String)
     case fileTooLarge(sizeBytes: Int, limitBytes: Int)
+    case chunkingFailed(String)
+    case partialFailure(partialText: String, completedChunks: Int, totalChunks: Int, underlying: Error)
 
     var errorDescription: String? {
         switch self {
@@ -868,7 +1158,11 @@ private enum TranscriptionError: LocalizedError {
         case .fileTooLarge(let size, let limit):
             let sizeMB = Double(size) / 1_048_576
             let limitMB = Double(limit) / 1_048_576
-            return String(format: "Audio file is %.1f MB — OpenAI's transcription API rejects anything over %.0f MB. Trim or split the recording before transcribing.", sizeMB, limitMB)
+            return String(format: "Audio file is %.1f MB — OpenAI's transcription API rejects anything over %.0f MB and automatic chunking did not produce uploadable pieces.", sizeMB, limitMB)
+        case .chunkingFailed(let detail):
+            return "Could not split the audio file into chunks: \(detail)"
+        case .partialFailure(_, let done, let total, let underlying):
+            return "Transcribed \(done) of \(total) chunks before failure: \(underlying.localizedDescription)"
         }
     }
 }

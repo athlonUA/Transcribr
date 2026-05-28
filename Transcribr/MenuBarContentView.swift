@@ -228,9 +228,15 @@ struct MenuBarContentView: View {
             HStack(spacing: 6) {
                 ProgressView()
                     .controlSize(.small)
-                Text("Transcribing audio…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let progress = recorder.transcriptionProgress, progress.total > 1 {
+                    Text("Transcribing chunk \(progress.current) of \(progress.total)…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Transcribing audio…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(8)
             .frame(maxWidth: .infinity, alignment: .leading)

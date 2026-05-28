@@ -25,29 +25,39 @@ into a single `.m4a` (AAC) file, then optionally transcribes the result via Open
 
 After a recording is saved (or any audio file is picked from disk), transcription is **manual**:
 
-- **Transcribe Last Recording** button uses the most recent recording's URL.
+- **Transcribe Last Recording** uses the most recent recording's URL.
 - **Choose File…** opens an `NSOpenPanel` for any `.m4a` / `.mp3` / `.mp4` / `.wav`.
 
-The transcript is:
+The transcript is **written incrementally** next to the audio file as a sibling `.txt` (same stem) and copied to the system pasteboard after every successful chunk. If the app is force-quit, crashes, or loses power mid-transcription, everything transcribed up to that point is already on disk.
 
-- written next to the audio file as a sibling `.txt` (same stem), and
-- immediately copied to the system pasteboard.
+### Chunked uploads
 
-The popover banner shows the state — `Transcribing audio…` (with progress), `Transcription copied` (with a `Copy Again` button), or `Transcription failed` with the underlying error.
+OpenAI's transcription endpoint imposes **two** independent limits per request:
+
+- **25 MB upload size cap.**
+- **1400 audio-seconds duration cap** on `gpt-4o-transcribe` / `gpt-4o-mini-transcribe` (Whisper-1 has no documented duration cap, but we apply the same target across all models for uniform behaviour).
+
+When either is exceeded, the file is automatically split into temporary `.m4a` chunks under `~/var/folders/.../T/` — sized to ~22 MB **and** ≤ 1200 s each (3 s margin under each cap). Adjacent chunks **overlap by 3 seconds**, so words that fall on an AAC frame-aligned cut survive in at least one chunk. The overlap produces mild duplication in the output text, which is acceptable for voice transcripts.
+
+The chunking path:
+- **AAC sources** (everything recorded by the app) use `AVAssetExportPresetPassthrough` — AAC frames are copied byte-for-byte, no quality loss, no re-encoding overhead.
+- **Non-AAC sources** (e.g. a `.wav` or `.mp3` picked via Choose File) use `AVAssetExportPresetAppleM4A` (re-encode to AAC) with a more conservative 600-second chunk target since the re-encode bitrate is independent of the source.
+
+Each chunk uploads sequentially. After every successful chunk, the running text is appended to the on-disk `.txt` and the clipboard is refreshed. If a later chunk fails (e.g. OpenAI 429 rate-limit), the popover banner shows how many chunks completed and the `.txt` carries an annotation noting the truncation point — earlier chunks' work is never discarded.
+
+Temp chunk files are deleted after the run regardless of success or failure. The original audio file is never modified.
 
 ### Settings
 
 Inside the popover, the `Transcription Settings` disclosure exposes:
 
-- **API key** — a `SecureField` for the OpenAI key (stored in `UserDefaults`). The adjacent `Clear` button wipes it; clicking anywhere in the popover outside the field defocuses it (visible confirmation that the value is saved).
+- **API key** — a `SecureField` for the OpenAI key (stored in `UserDefaults`, plaintext on disk; see Known Limitations). The adjacent `Clear` button wipes it; clicking anywhere in the popover outside the field defocuses it (visible confirmation that the value is saved).
 - **Model picker** — pick one of:
   - `whisper-1` — Whisper v2 (2022), baseline.
   - `gpt-4o-mini-transcribe` — **default**. Newer than Whisper v2, half the price, better accuracy.
   - `gpt-4o-transcribe` — best quality, same price as `whisper-1`.
 
 There is a one-shot `.env` migration on the very first launch: if `OPENAI_API_KEY` is set in the process environment or found at `~/.transcribr/.env` / `~/Documents/Transcribr/.env` (also `~/Projects/Transcribr/.env` in `DEBUG` builds), it is imported into `UserDefaults` and an `envMigrationDone` flag is set. After that, `.env` is never re-consulted — clearing the key in the popover sticks across restarts.
-
-Upload size is capped pre-flight at **25 MB** (OpenAI's hard limit) with a clear error rather than a confusing server-side rejection. Multipart filenames are sanitised to keep the boundary well-formed even when picking an arbitrary file via Choose File….
 
 ## Build & run
 
@@ -119,11 +129,11 @@ For transcription, after one of the rows passes: paste an API key in Transcripti
 
 ## Known limitations
 
+- **Voice Processing AU may coerce the mic to mono.** When `setVoiceProcessingEnabled(true)` is applied to the input node, macOS swaps in the VoIP audio unit which can change the input format — most often that means stereo USB / built-in mic gets downmixed to mono before reaching the engine. The downstream `customMixer` resamples back to the canonical 48 kHz / stereo so the mix path stays valid and quality is fine for voice, but you lose any stereo separation the mic was capturing. If you need a true stereo mic capture, the VP path will not give it to you.
 - **Bluetooth + microphone input quality.** When a Bluetooth headset is selected as the input device, macOS may switch the link into HFP profile (16 kHz mono telephony). The mic track will then be 16 kHz; the system-audio track captured by `SCStream` is unaffected (still 48 kHz stereo, pre-HAL). This is a macOS Bluetooth limitation — for best mic quality, use the built-in mic or a wired/USB mic and keep BT for output only.
 - **Screen Recording permission needs a restart** after the user first enables it in System Settings. macOS does not propagate the new permission to a running process. The app detects this and shows a banner.
 - **Recording stops on audio-device changes**: if you plug or unplug headphones/Bluetooth mid-recording, the engine emits `AVAudioEngineConfigurationChange`. The app stops the recording with an explicit error rather than continuing to write silence into a half-broken graph. Restart the recording after the device change settles.
-- **Acoustic echo when not wearing headphones**: if the system audio plays through speakers, the mic also picks it up acoustically in addition to the digital `SCStream` capture. The file is still correct, but the system audio portion may sound slightly louder/echoey. Headphones avoid this.
-- **OpenAI 25 MB upload cap.** Transcription rejects files over 25 MB pre-flight with a clear error. At the default 128 kbps AAC that's roughly 25 minutes of audio — for longer recordings, trim or split before transcribing.
+- **Acoustic echo cancellation is enabled by default.** Voice Processing AU references the system output device's playback signal and subtracts it from the mic input, so e.g. a Google Meet call played through laptop speakers does not get re-captured by the mic (it is still captured cleanly via `SCStream`). Residual echo can still appear on hardware where Voice Processing fails silently.
 - **API key is stored in `UserDefaults` plaintext** (`~/Library/Preferences/com.transcribr.Transcribr.plist`). Convenient for a local dev app but inappropriate for a shipped binary — a production version should migrate this storage to Keychain.
 - **Ad-hoc code signing reshuffles TCC.** Building from Xcode produces a new CDHash on every source change, and macOS's TCC database keys Screen Recording grants by CDHash for ad-hoc-signed apps. Practical upshot: each rebuild may require re-granting Screen Recording (toggle in Settings → restart). Real Developer ID signing (TeamID-based) eliminates this churn for shipped builds.
 - **No MP3 export.** Recording output is AAC `.m4a` only; MP3 can be added later via `AVAssetExportSession` or `ffmpeg`.
