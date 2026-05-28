@@ -6,6 +6,7 @@ struct MenuBarContentView: View {
     @ObservedObject var recorder: AudioRecorder
     @ObservedObject var directoryStore: RecordsDirectoryStore
     @ObservedObject var settingsStore: SettingsStore
+    @ObservedObject var micMuteService: MicMuteService
 
     @State private var settingsExpanded: Bool = false
     @FocusState private var apiKeyFocused: Bool
@@ -22,6 +23,8 @@ struct MenuBarContentView: View {
             Divider()
 
             transcriptionSettings
+
+            micMuteRow
 
             Divider()
 
@@ -59,8 +62,49 @@ struct MenuBarContentView: View {
         .onAppear {
             Task { @MainActor in
                 await recorder.refreshPermissions()
+                // Re-check Accessibility every time the popover opens. TCC has no callback
+                // for the user toggling the switch, so popover-open is our natural retry.
+                micMuteService.start()
             }
         }
+    }
+
+    /// Inline recorder row tucked under `Transcription Settings`, sharing its visual group
+    /// (no divider between). On `Change hotkey` the right half flips to "Press shortcut…
+    /// Cancel" via `isCapturingHotkey`. No separate sheet / Settings window — popover already
+    /// has key window focus, which is what `NSEvent.addLocalMonitorForEvents` needs.
+    @ViewBuilder
+    private var micMuteRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: micMuteService.isMuted ? "mic.slash.fill" : "mic.fill")
+                .foregroundStyle(micMuteService.isMuted ? .red : .primary)
+                .frame(width: 14)
+            Text("Mic Mute:")
+                .font(.caption)
+            if micMuteService.isCapturingHotkey {
+                Text("Press shortcut…")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Cancel") {
+                    micMuteService.cancelCapture()
+                }
+                .controlSize(.small)
+            } else {
+                Text(micMuteService.hotkey.description)
+                    .font(.caption.monospaced())
+                Spacer()
+                Button("Change hotkey") {
+                    // Completion fires for both success and Esc/cancel paths; we don't need
+                    // either branch — @Published `hotkey` and `isCapturingHotkey` already
+                    // trigger the view refresh.
+                    micMuteService.startCapture { _ in }
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
     }
 
     @ViewBuilder
@@ -139,7 +183,9 @@ struct MenuBarContentView: View {
 
     private var header: some View {
         HStack(spacing: 6) {
-            WaveformBarsIcon(isAnimating: recorder.isRecording)
+            // Header waveform reflects only recording state; the mute slash stays in the
+            // menu-bar tray icon where it's always visible.
+            WaveformBarsIcon(isAnimating: recorder.isRecording, isMuted: false)
             Text("Transcribr")
                 .font(.headline)
             Spacer()
@@ -180,13 +226,31 @@ struct MenuBarContentView: View {
                     ]
                 )
             }
+            if !micMuteService.hasAccessibility {
+                // Mirrors the Screen Recording banner shape: TCC prompt button first, deep-link
+                // fallback second. Re-check is implicit — `.onAppear` re-runs `start()` every
+                // time the popover opens, so toggling the System Settings switch and reopening
+                // the popover is the natural retry.
+                permissionBanner(
+                    title: "Accessibility access required",
+                    detail: "Enable Transcribr in System Settings → Privacy & Security → Accessibility.",
+                    actions: [
+                        .init(label: "Request Accessibility Access", action: {
+                            _ = micMuteService.requestAccessibilityIfNeeded()
+                        }),
+                        .init(label: "Open System Settings", action: {
+                            micMuteService.openAccessibilitySettings()
+                        }),
+                    ]
+                )
+            }
             switch recorder.screenPermission {
             case .granted:
                 EmptyView()
             case .notDetermined:
                 permissionBanner(
                     title: "Screen Recording access required",
-                    detail: "macOS will show a prompt and add Transcribr to System Settings → Privacy & Security → Screen Recording. Enable it there, then restart Transcribr.",
+                    detail: "Enable Transcribr in System Settings → Privacy & Security → Screen Recording, then restart the app.",
                     actions: [
                         .init(label: "Request Screen Recording Access", action: {
                             recorder.requestScreenRecordingAccess()
@@ -196,7 +260,7 @@ struct MenuBarContentView: View {
             case .denied:
                 permissionBanner(
                     title: "Screen Recording access required",
-                    detail: "Enable Transcribr in System Settings → Privacy & Security → Screen Recording, then restart the app. If toggling didn't help, remove Transcribr from that list with the \u{2212} button, click \u{201C}Request Screen Recording Access\u{201D} below to re-add it, then toggle ON and restart.",
+                    detail: "Enable Transcribr in System Settings → Privacy & Security → Screen Recording, then restart the app.",
                     actions: [
                         .init(label: "Request Screen Recording Access", action: {
                             recorder.requestScreenRecordingAccess()
@@ -250,7 +314,7 @@ struct MenuBarContentView: View {
                     .font(.caption.bold())
                     .foregroundStyle(.green)
                 Spacer()
-                Button("Copy Again") {
+                Button("Copy again") {
                     copyTranscription(from: url)
                 }
                 .controlSize(.small)

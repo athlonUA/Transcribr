@@ -15,6 +15,9 @@
 		AA00000000000000000000D6 /* MenuBarContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000D5 /* MenuBarContentView.swift */; };
 		AA00000000000000000000EB /* RecordsDirectoryStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000EA /* RecordsDirectoryStoreTests.swift */; };
 		AA00000000000000000000EF /* AudioRecorderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000000000000000000EE /* AudioRecorderTests.swift */; };
+		AA0000000000000000000F1 /* Hotkey.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000F2 /* Hotkey.swift */; };
+		AA0000000000000000000F3 /* MicMuteService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000F4 /* MicMuteService.swift */; };
+		AA0000000000000000000F5 /* HotkeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000F6 /* HotkeyTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -39,6 +42,9 @@
 		AA00000000000000000000E2 /* TranscribrTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TranscribrTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA00000000000000000000EA /* RecordsDirectoryStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordsDirectoryStoreTests.swift; sourceTree = "<group>"; };
 		AA00000000000000000000EE /* AudioRecorderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorderTests.swift; sourceTree = "<group>"; };
+		AA0000000000000000000F2 /* Hotkey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Hotkey.swift; sourceTree = "<group>"; };
+		AA0000000000000000000F4 /* MicMuteService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicMuteService.swift; sourceTree = "<group>"; };
+		AA0000000000000000000F6 /* HotkeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotkeyTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -75,6 +81,8 @@
 				AA00000000000000000000D5 /* MenuBarContentView.swift */,
 				AA00000000000000000000D1 /* AudioRecorder.swift */,
 				AA00000000000000000000D3 /* RecordsDirectoryStore.swift */,
+				AA0000000000000000000F2 /* Hotkey.swift */,
+				AA0000000000000000000F4 /* MicMuteService.swift */,
 				AA00000000000000000000D7 /* Transcribr.entitlements */,
 				AA00000000000000000000A8 /* Assets.xcassets */,
 				AA00000000000000000000AC /* Preview Content */,
@@ -104,6 +112,7 @@
 			children = (
 				AA00000000000000000000EA /* RecordsDirectoryStoreTests.swift */,
 				AA00000000000000000000EE /* AudioRecorderTests.swift */,
+				AA0000000000000000000F6 /* HotkeyTests.swift */,
 			);
 			path = TranscribrTests;
 			sourceTree = "<group>";
@@ -212,6 +221,8 @@
 				AA00000000000000000000D2 /* AudioRecorder.swift in Sources */,
 				AA00000000000000000000D4 /* RecordsDirectoryStore.swift in Sources */,
 				AA00000000000000000000D6 /* MenuBarContentView.swift in Sources */,
+				AA0000000000000000000F1 /* Hotkey.swift in Sources */,
+				AA0000000000000000000F3 /* MicMuteService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -221,6 +232,7 @@
 			files = (
 				AA00000000000000000000EB /* RecordsDirectoryStoreTests.swift in Sources */,
 				AA00000000000000000000EF /* AudioRecorderTests.swift in Sources */,
+				AA0000000000000000000F5 /* HotkeyTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

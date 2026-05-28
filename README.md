@@ -60,6 +60,28 @@ Inside the popover, the `Transcription Settings` disclosure exposes:
 
 There is a one-shot `.env` migration on the very first launch: if `OPENAI_API_KEY` is set in the process environment or found at `~/.transcribr/.env` / `~/Documents/Transcribr/.env` (also `~/Projects/Transcribr/.env` in `DEBUG` builds), it is imported into `UserDefaults` and an `envMigrationDone` flag is set. After that, `.env` is never re-consulted — clearing the key in the popover sticks across restarts.
 
+## Global mic mute
+
+Independently of recording, the menu-bar app installs a global hotkey that toggles the system's
+default input device mute from any foreground application. Default binding: **Fn + ⇧ + `**.
+The hotkey is configurable from the popover (`Mic Mute: <combo>  [Change hotkey]` row tucked
+under `Transcription Settings`); click `Change hotkey`, press a new combination, and it is
+stored in `UserDefaults` immediately. Esc cancels the recorder; plain alphanumeric keys
+without any modifier are rejected so the hotkey can't silently swallow letters in other apps.
+
+Mute state surfaces in two places. The menu-bar tray waveform picks up a diagonal slash
+whenever the mic is muted (regardless of whether a recording is in progress); the popover
+header waveform deliberately does not — it reflects recording state only, so the menu-bar
+icon stays the single always-visible mute indicator. Inside the popover, the `Mic Mute` row
+uses an SF Symbol microphone (`mic.fill`, switching to a red `mic.slash.fill` while muted).
+
+Implementation: `CGEvent` session-level event tap on the mach-port thread for global capture
+(`CGEvent.tapCreate(.cgSessionEventTap, .headInsertEventTap, …)`), CoreAudio HAL property
+`kAudioDevicePropertyMute` on `kAudioDevicePropertyScopeInput` for the actual mute, with a
+`kAudioDevicePropertyVolumeScalar = 0` fallback for devices like the MacBook built-in mic that
+don't expose hardware mute. A `kAudioHardwarePropertyDefaultInputDevice` listener keeps the
+published `isMuted` in sync when the user plugs in / unplugs a USB mic mid-session.
+
 ## Build & run
 
 ```bash
@@ -78,6 +100,8 @@ Or open `Transcribr.xcodeproj` in Xcode and hit Run.
 
 - **Microphone** is **optional**. macOS shows a TCC prompt on first Start; granting it adds your voice to every subsequent recording. Denying it (or revoking later in System Settings) doesn't block the app — sessions just capture system audio only.
 
+- **Accessibility** is **optional** — required only by the global mic-mute hotkey. Enable Transcribr in System Settings → Privacy & Security → Accessibility, then re-open the popover so the app re-checks. Without it, the popover shows a banner and the hotkey is inactive; recording continues to work unaffected. Unlike Screen Recording, Accessibility *does* propagate to the running process — no app restart needed, just popover re-open.
+
 Transcription only needs a valid OpenAI API key — no extra system permission.
 
 ## Tests
@@ -87,7 +111,7 @@ xcodebuild -project Transcribr.xcodeproj -scheme Transcribr \
   -configuration Debug -destination 'platform=macOS' test
 ```
 
-Current coverage: **52 unit tests** across two suites.
+Current coverage: **69 unit tests** across three suites.
 
 `AudioRecorderTests` (45):
 - File-name format, single-digit padding.
@@ -105,7 +129,15 @@ Current coverage: **52 unit tests** across two suites.
 `RecordsDirectoryStoreTests` (7):
 - Defaults, init with/without stored value, persistence round-trip across re-init, directory creation, idempotency.
 
-The wired-up audio capture path (engine pulling from the HAL + SCStream samples + mixed AAC encode) and the real OpenAI HTTP call are out of scope for `xcodebuild test` — they need live TCC permissions, audio hardware, and network. Verify those manually using the matrix below.
+`HotkeyTests` (17):
+- `Hotkey.default` constants, `modifierMask` shape.
+- `init(keyCode:flags:)` strips CapsLock + every non-modifier bit.
+- JSON round-trip preserves both fields; persisted JSON with extra bits is sanitized on decode.
+- `description` rendering for each modifier (Fn, ⌃, ⌥, ⇧, ⌘) and the Apple HIG combined order.
+- Unmapped keyCode falls back to `Key <n>`.
+- `isValidForGlobal` truth table — rejects plain alphanumeric (letters + digits); accepts Esc / F-keys / Space / unmapped codes / any alphanumeric with at least one real modifier; CapsLock-only does not count as a modifier.
+
+The wired-up audio capture path (engine pulling from the HAL + SCStream samples + mixed AAC encode), the real OpenAI HTTP call, and the CoreAudio/CGEventTap pieces of `MicMuteService` are out of scope for `xcodebuild test` — they need live TCC permissions, audio hardware, network, and an Accessibility grant. Verify those manually using the matrix below.
 
 ## Manual test plan
 
@@ -146,6 +178,9 @@ For transcription, after one of the rows passes: paste an API key in Transcripti
 - **No MP3 export.** Recording output is AAC `.m4a` only; MP3 can be added later via `AVAssetExportSession` or `ffmpeg`.
 - **End-of-recording tail**: when End Record is clicked, the last few buffers already scheduled on `AVAudioPlayerNode` are dropped. Acceptable for an MVP.
 - **Distribution signing not configured.** Project builds with "Sign to Run Locally" (ad-hoc). For notarized Developer ID distribution, set `DEVELOPMENT_TEAM` and `CODE_SIGN_IDENTITY = "Developer ID Application"` in `project.pbxproj` for the Release configuration. The `com.apple.security.device.audio-input` entitlement is already in place for the hardened-runtime path.
+- **Apple Dictation / Siri / Voice Control bypass user-space mute.** Those services run their own private audio pipeline (`corespeechd`, `assistantd`) that reads the microphone hardware directly, ignoring the CoreAudio `kAudioDevicePropertyMute` flag we set. Their built-in Fn+F5 / wake phrase will continue to record your voice even while the mic-mute hotkey reports `isMuted = true`. This is a macOS architectural limitation; there's no workaround short of disabling SIP. The mute *is* effective against every regular consumer of the input device (Zoom, Meet, Discord, browsers, QuickTime, etc.).
+- **Built-in MacBook microphone has no hardware mute.** The Apple-supplied built-in mic typically doesn't expose `kAudioDevicePropertyMute` as settable. `MicMuteService` falls back to setting `kAudioDevicePropertyVolumeScalar = 0` and restoring the prior value on unmute (saved to `UserDefaults` only when it was > 0, so the user can't get locked at zero). Effective for the apps above, but System Settings → Sound → Input will show the slider sliding to 0 while muted — that's the fallback at work, not a UI glitch.
+- **Ad-hoc codesign + Accessibility behaves like Screen Recording.** Each rebuild produces a new CDHash; TCC keys the Accessibility grant by CDHash for ad-hoc-signed apps, so the grant may need to be re-issued after each `xcodebuild` run. Real Developer ID signing (TeamID-based) eliminates this churn.
 
 ## Fallback if `ScreenCaptureKit` ever fails on a system
 
