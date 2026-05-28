@@ -392,6 +392,28 @@ final class AudioRecorderTests: XCTestCase {
         XCTAssertLessThan(plan.advanceSeconds, plan.chunkDurationSeconds)
     }
 
+    // MARK: - shouldStartAfterRestart (auto-restart decision)
+
+    func test_shouldStartAfterRestart_proceedsOnlyWhenIdleAndNotCancelled() {
+        XCTAssertTrue(AudioRecorder.shouldStartAfterRestart(state: .idle, cancelRequested: false))
+    }
+
+    func test_shouldStartAfterRestart_skipsWhenCancelRequested() {
+        XCTAssertFalse(AudioRecorder.shouldStartAfterRestart(state: .idle, cancelRequested: true),
+                       "user-cancelled restarts must stop after performStop and not start a new session")
+    }
+
+    func test_shouldStartAfterRestart_skipsForAnyNonIdleState() {
+        // performStop leaves us in `.idle`; any other state at this point means something else
+        // mutated the state machine and we shouldn't blindly restart.
+        for state in [RecorderState.recording, .starting, .stopping] {
+            XCTAssertFalse(AudioRecorder.shouldStartAfterRestart(state: state, cancelRequested: false),
+                           "non-idle state \(state) must not trigger a fresh restart")
+            XCTAssertFalse(AudioRecorder.shouldStartAfterRestart(state: state, cancelRequested: true),
+                           "non-idle state \(state) with cancel must not trigger a fresh restart")
+        }
+    }
+
     // MARK: - CMSampleBuffer helper
 
     /// Builds a Float32 PCM CMSampleBuffer for tests.

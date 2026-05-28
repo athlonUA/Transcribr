@@ -109,12 +109,20 @@ final class AudioRecorder: NSObject, ObservableObject {
     @Published private(set) var state: RecorderState = .idle
     @Published private(set) var transcriptionState: TranscriptionState = .idle
     @Published private(set) var transcriptionProgress: TranscriptionProgress?
+    /// True while `handleAudioConfigurationChange` is between `.stopping` and the next
+    /// `.recording`. The UI swaps the generic "Stopping…/Starting…" busy spinner for an
+    /// active Cancel button so the user can abandon a restart they don't want.
+    @Published private(set) var autoRestartInProgress: Bool = false
 
     private let directoryStore: RecordsDirectoryStore
     private let settingsStore: SettingsStore
     private var session: RecordingSession?
     private var watchdogTask: Task<Void, Never>?
     private var configChangeObserver: NSObjectProtocol?
+    /// Set by `cancelAutoRestart()` from the UI; consumed by `handleAudioConfigurationChange`
+    /// after `performStop()` returns. Reset on every restart entry so a stale Cancel from a
+    /// previous restart attempt never leaks into the next one.
+    private var autoRestartCancelRequested: Bool = false
     /// MainActor-isolated. Persisted to disk + clipboard after every chunk so a crash mid-run
     /// leaves the in-progress transcript already saved.
     private var currentAccumulatedText: String = ""
@@ -177,13 +185,24 @@ final class AudioRecorder: NSObject, ObservableObject {
 
     @MainActor
     func refreshPermissions() async {
-        micPermission = AudioRecorder.mapMicStatus(AVCaptureDevice.authorizationStatus(for: .audio))
+        refreshMicPermission()
         screenPermission = await probeScreenAccess()
+    }
+
+    /// Sync-only mic probe — `AVCaptureDevice.authorizationStatus(for: .audio)` is a cheap TCC
+    /// query (<1ms). Split out so `performStart`'s warm path can refresh mic without paying for
+    /// the slow `SCShareableContent` probe.
+    @MainActor
+    private func refreshMicPermission() {
+        micPermission = AudioRecorder.mapMicStatus(AVCaptureDevice.authorizationStatus(for: .audio))
     }
 
     private func probeScreenAccess() async -> ScreenCapturePermission {
         do {
-            _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            // We only need to know IF we have access, not what's shareable — and we never read
+            // `.windows` from the result. The `(true, true)` filter pair skips desktop windows
+            // and off-screen windows, shaving 100-500ms on systems with many open windows.
+            _ = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
             return .granted
         } catch {
             let didRequest = UserDefaults.standard.bool(forKey: Self.didRequestScreenRecordingKey)
@@ -219,9 +238,25 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
     }
 
+    /// `silent` mutes the watchdog's banner if no system audio arrives within the timeout —
+    /// used by the auto-restart path on `AVAudioEngineConfigurationChange` to honour the
+    /// "no error banner on device-change restart" contract. The watchdog STILL stops the
+    /// recording on trip; it just doesn't surface why. Sync failure paths in performStart
+    /// (mic denied, screen denied, buildSession throw) keep setting `lastError`; the caller
+    /// in `handleAudioConfigurationChange` wipes that synchronously after the await.
     @MainActor
-    private func performStart() async {
-        await refreshPermissions()
+    private func performStart(silentWatchdog: Bool = false) async {
+        // Warm-start optimization: refresh mic synchronously (cheap), but only probe screen
+        // access via `SCShareableContent` if we don't already believe it's granted. The slow
+        // probe enumerates shareable displays/windows and dominates the cold-start time —
+        // running it on every start, including auto-restarts after a route change, adds
+        // hundreds of ms of avoidable latency. If permission was revoked between recordings
+        // the `buildSession` `SCShareableContent` call below will throw, surfacing the error
+        // via the standard `Failed to start recording` path.
+        refreshMicPermission()
+        if screenPermission != .granted {
+            screenPermission = await probeScreenAccess()
+        }
 
         if micPermission == .undetermined {
             let granted = await AVCaptureDevice.requestAccess(for: .audio)
@@ -257,7 +292,7 @@ final class AudioRecorder: NSObject, ObservableObject {
             }
             session = newSession
             installConfigChangeObserver(for: newSession.engine)
-            startWatchdog()
+            startWatchdog(silent: silentWatchdog)
             currentURL = newSession.fileURL
             recordingStartedAt = Date()
             // Don't clobber a still-running transcription from a prior recording.
@@ -268,6 +303,20 @@ final class AudioRecorder: NSObject, ObservableObject {
             isRecording = true
             state = .recording
         } catch {
+            // Recovery path for the warm-start optimization above: if we skipped the slow
+            // screen probe assuming `screenPermission == .granted` but permission was revoked
+            // between recordings, `buildSession`'s `SCShareableContent` call throws an opaque
+            // error. Re-probe here so the banner shows the actionable "enable in System
+            // Settings" message instead of a generic SC failure. The re-probe only runs on
+            // the failure path so the happy-path latency win is preserved.
+            if screenPermission == .granted {
+                screenPermission = await probeScreenAccess()
+                if screenPermission != .granted {
+                    lastError = "Screen Recording permission is required to capture system audio. Enable Transcribr in System Settings → Privacy & Security → Screen Recording, then restart Transcribr."
+                    state = .idle
+                    return
+                }
+            }
             lastError = "Failed to start recording: \(error.localizedDescription)"
             state = .idle
         }
@@ -375,8 +424,9 @@ final class AudioRecorder: NSObject, ObservableObject {
         let fileURL = Self.uniqueFileURL(in: directory)
 
         // Probe screen permission before allocating any audio resources so a missing-permission
-        // throw doesn't leak a half-built engine.
-        let scContent = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        // throw doesn't leak a half-built engine. `(true, true)` skips desktop wallpaper +
+        // off-screen windows; we only read `.displays` so window enumeration is pure waste.
+        let scContent = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
         let display = scContent.displays.first(where: { $0.displayID == CGMainDisplayID() })
             ?? scContent.displays.first
         guard let display else { throw RecorderError.noDisplayAvailable }
@@ -506,8 +556,12 @@ final class AudioRecorder: NSObject, ObservableObject {
         }
     }
 
+    /// `silent` suppresses the banner if no system audio arrives within the window — the
+    /// recording is still stopped (we never want to keep a zero-audio session running), but the
+    /// user is not informed. Used by the auto-restart path so a slow device hand-off doesn't
+    /// surface a misleading "no system audio" error mid-route-change.
     @MainActor
-    private func startWatchdog() {
+    private func startWatchdog(silent: Bool = false) {
         watchdogTask?.cancel()
         let deadlineNanos = UInt64(Self.systemAudioWatchdogSeconds * 1_000_000_000)
         watchdogTask = Task { @MainActor [weak self] in
@@ -518,7 +572,9 @@ final class AudioRecorder: NSObject, ObservableObject {
             guard !session.didReceiveAnyAudio() else { return }
 
             self.state = .stopping
-            self.lastError = "No system audio samples were received within \(Int(Self.systemAudioWatchdogSeconds))s. Re-toggle Screen Recording for Transcribr in System Settings → Privacy & Security → Screen Recording, then restart the app."
+            if !silent {
+                self.lastError = "No system audio samples were received within \(Int(Self.systemAudioWatchdogSeconds))s. Re-toggle Screen Recording for Transcribr in System Settings → Privacy & Security → Screen Recording, then restart the app."
+            }
             await self.performStop()
         }
     }
@@ -531,13 +587,70 @@ final class AudioRecorder: NSObject, ObservableObject {
             object: engine,
             queue: .main
         ) { [weak self] _ in
+            // The outer `[weak self]` is load-bearing: without it the inner Task's `[weak self]`
+            // would resolve against the enclosing method's strong `self`, dragging a strong
+            // capture of `AudioRecorder` (non-Sendable) into the `@Sendable` Task closure.
             Task { @MainActor [weak self] in
-                guard let self, self.state == .recording else { return }
-                self.state = .stopping
-                self.lastError = "Audio device configuration changed mid-recording (input or output switched). Recording stopped to avoid a truncated file."
-                await self.performStop()
+                await self?.handleAudioConfigurationChange()
             }
         }
+    }
+
+    /// Auto-restart on `AVAudioEngineConfigurationChange` (headphones plugged in/removed,
+    /// AirPods (dis)connected, default device switched). The engine just had its input format
+    /// pulled out from under it — we finalize the current `.m4a` and spin up a fresh session
+    /// bound to whatever the system has routed to now. The user gets N short files per
+    /// session (one per device change) instead of one mixed-rate file AAC can't represent.
+    ///
+    /// During `.stopping` the UI offers a Cancel button (`cancelAutoRestart()`); we check
+    /// `autoRestartCancelRequested` after `performStop()` and skip the restart if set. After
+    /// we commit to `.starting` the user has to wait until the new session reaches
+    /// `.recording` and use the normal Stop button.
+    ///
+    /// `lastError` is cleared before `performStart` so a stale message from earlier doesn't
+    /// linger. On `performStart` failure (mic permission revoked, no input device) the new
+    /// error stays put — permanent failures must be visible to the user. The previous
+    /// recording is finalized on disk either way.
+    ///
+    /// Re-entrancy: `guard state == .recording` debounces stacked changes — any change firing
+    /// while we're mid-restart is ignored; once we re-enter `.recording` a fresh change
+    /// triggers another restart.
+    @MainActor
+    private func handleAudioConfigurationChange() async {
+        guard state == .recording else { return }
+        autoRestartCancelRequested = false
+        autoRestartInProgress = true
+        state = .stopping
+        await performStop()
+
+        guard Self.shouldStartAfterRestart(state: state, cancelRequested: autoRestartCancelRequested) else {
+            autoRestartInProgress = false
+            return
+        }
+
+        state = .starting
+        lastError = nil
+        // `silentWatchdog: true` keeps the 2-s "no system audio" watchdog from surfacing a
+        // banner mid route-change. Sync failures inside `performStart` still set `lastError`
+        // and we deliberately don't wipe it — permanent revocations must remain visible.
+        await performStart(silentWatchdog: true)
+        autoRestartInProgress = false
+    }
+
+    /// Sets the cancel flag consumed by `handleAudioConfigurationChange` after `performStop()`
+    /// returns. Only takes effect while an auto-restart is actually in progress — a stray call
+    /// while recording normally is a no-op.
+    @MainActor
+    func cancelAutoRestart() {
+        guard autoRestartInProgress else { return }
+        autoRestartCancelRequested = true
+    }
+
+    /// Pure decision function — given `state` (after `performStop` returns) and the cancel
+    /// flag, should the auto-restart proceed to `performStart`? Extracted so the restart's
+    /// state-machine policy is unit-testable without spinning up a real `AVAudioEngine`.
+    static func shouldStartAfterRestart(state: RecorderState, cancelRequested: Bool) -> Bool {
+        state == .idle && !cancelRequested
     }
 
     @MainActor

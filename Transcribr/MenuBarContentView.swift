@@ -281,7 +281,14 @@ struct MenuBarContentView: View {
         case .starting:
             busyButton(title: "Starting…", tint: .green)
         case .stopping:
-            busyButton(title: "Stopping…", tint: .red)
+            // The auto-restart path uses `.stopping` as its cancellation window — surface a
+            // real button there so the user can abandon a route-change restart they don't
+            // want. User-initiated stops show the plain busy spinner.
+            if recorder.autoRestartInProgress {
+                cancelRestartButton
+            } else {
+                busyButton(title: "Stopping…", tint: .red)
+            }
         case .recording:
             Button {
                 recorder.stop()
@@ -304,6 +311,18 @@ struct MenuBarContentView: View {
             .buttonStyle(.borderedProminent)
             .disabled(!recorder.canStart)
         }
+    }
+
+    private var cancelRestartButton: some View {
+        Button {
+            recorder.cancelAutoRestart()
+        } label: {
+            Label("Switching device — Cancel", systemImage: "arrow.triangle.2.circlepath")
+                .frame(maxWidth: .infinity)
+        }
+        .controlSize(.large)
+        .tint(.orange)
+        .buttonStyle(.borderedProminent)
     }
 
     private func busyButton(title: String, tint: Color) -> some View {
