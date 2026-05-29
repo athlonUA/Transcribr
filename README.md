@@ -190,3 +190,8 @@ If on some specific macOS/hardware combination `SCStream` consistently fails or 
 - [Loopback](https://rogueamoeba.com/loopback/) — paid, GUI for routing.
 
 In that mode both mic and virtual-loopback inputs would be captured via `AVAudioEngine` (aggregate device or two `AVCaptureSession` inputs), and `ScreenCaptureKit` would not be required. Not implemented in this MVP because the native path works on supported macOS 13+ systems.
+
+## License
+
+This project is licensed under the MIT License.  
+You are free to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the software, including for commercial purposes. See the [LICENSE](./LICENSE) file for details.
