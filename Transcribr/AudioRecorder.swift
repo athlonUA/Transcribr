@@ -4,6 +4,7 @@ import CoreMedia
 import Foundation
 import os
 import ScreenCaptureKit
+import Security
 
 enum MicrophonePermission: Equatable {
     case undetermined
@@ -52,16 +53,23 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
     }
 }
 
-/// `UserDefaults` is plaintext on disk; a shipped product should migrate the API key to Keychain.
+/// API key lives in the macOS Keychain; only non-sensitive prefs stay in `UserDefaults`.
 final class SettingsStore: ObservableObject {
-    static let apiKeyDefaultsKey = "transcribr.openAIAPIKey"
+    /// Legacy plaintext location — read once for migration, then cleared.
+    static let legacyAPIKeyDefaultsKey = "transcribr.openAIAPIKey"
     static let modelDefaultsKey = "transcribr.transcriptionModel"
     /// Without this flag, clearing the API key from the popover would be silently undone on
     /// the next launch as long as `.env` still exists.
     static let envMigrationDoneKey = "transcribr.envMigrationDone"
 
+    static let keychainService = "com.transcribr.Transcribr"
+    static let keychainAccount = "openai.api-key"
+
     @Published var apiKey: String {
-        didSet { UserDefaults.standard.set(apiKey, forKey: Self.apiKeyDefaultsKey) }
+        didSet {
+            guard apiKey != oldValue else { return }
+            KeychainStore.set(apiKey, service: Self.keychainService, account: Self.keychainAccount)
+        }
     }
 
     @Published var transcriptionModel: TranscriptionModel {
@@ -69,22 +77,100 @@ final class SettingsStore: ObservableObject {
     }
 
     init() {
-        let stored = UserDefaults.standard.string(forKey: Self.apiKeyDefaultsKey) ?? ""
-        let migrationDone = UserDefaults.standard.bool(forKey: Self.envMigrationDoneKey)
+        let defaults = UserDefaults.standard
+        let migrationDone = defaults.bool(forKey: Self.envMigrationDoneKey)
+        let keychainValue = KeychainStore.get(service: Self.keychainService, account: Self.keychainAccount) ?? ""
 
-        if !stored.isEmpty {
-            self.apiKey = stored
+        if !keychainValue.isEmpty {
+            self.apiKey = keychainValue
+        } else if let legacy = defaults.string(forKey: Self.legacyAPIKeyDefaultsKey), !legacy.isEmpty {
+            // One-time migration from UserDefaults → Keychain. Strip the plaintext copy after.
+            KeychainStore.set(legacy, service: Self.keychainService, account: Self.keychainAccount)
+            defaults.removeObject(forKey: Self.legacyAPIKeyDefaultsKey)
+            self.apiKey = legacy
         } else if !migrationDone, let migrated = EnvLoader.loadOpenAIKey(), !migrated.isEmpty {
-            UserDefaults.standard.set(migrated, forKey: Self.apiKeyDefaultsKey)
+            KeychainStore.set(migrated, service: Self.keychainService, account: Self.keychainAccount)
             self.apiKey = migrated
         } else {
+            // Drop any stale plaintext copy just in case.
+            defaults.removeObject(forKey: Self.legacyAPIKeyDefaultsKey)
             self.apiKey = ""
         }
         // Marked unconditionally so a later popover-clear sticks regardless of which branch above ran.
-        UserDefaults.standard.set(true, forKey: Self.envMigrationDoneKey)
+        defaults.set(true, forKey: Self.envMigrationDoneKey)
 
-        let rawModel = UserDefaults.standard.string(forKey: Self.modelDefaultsKey)
+        let rawModel = defaults.string(forKey: Self.modelDefaultsKey)
         self.transcriptionModel = TranscriptionModel(rawValue: rawModel ?? "") ?? .gpt4oMiniTranscribe
+    }
+}
+
+enum KeychainStore {
+    /// Writes `value` to the login keychain, replacing any existing item. An empty value deletes the item.
+    @discardableResult
+    static func set(_ value: String, service: String, account: String) -> Bool {
+        if value.isEmpty {
+            return delete(service: service, account: account)
+        }
+        guard let data = value.data(using: .utf8) else { return false }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+        ]
+
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if updateStatus == errSecSuccess { return true }
+        if updateStatus != errSecItemNotFound {
+            os_log("Keychain update failed: %d", type: .error, Int(updateStatus))
+            return false
+        }
+
+        var addQuery = query
+        addQuery.merge(attributes) { _, new in new }
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        if addStatus != errSecSuccess {
+            os_log("Keychain add failed: %d", type: .error, Int(addStatus))
+            return false
+        }
+        return true
+    }
+
+    static func get(service: String, account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess else {
+            if status != errSecItemNotFound {
+                os_log("Keychain read failed: %d", type: .error, Int(status))
+            }
+            return nil
+        }
+        guard let data = result as? Data, let value = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return value
+    }
+
+    @discardableResult
+    static func delete(service: String, account: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }
 

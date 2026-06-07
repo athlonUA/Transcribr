@@ -52,13 +52,13 @@ Temp chunk files are deleted after the run regardless of success or failure. The
 
 Inside the popover, the `Transcription Settings` disclosure exposes:
 
-- **API key** — a `SecureField` for the OpenAI key (stored in `UserDefaults`, plaintext on disk; see Known Limitations). The adjacent `Clear` button wipes it; clicking anywhere in the popover outside the field defocuses it (visible confirmation that the value is saved).
+- **API key** — a `SecureField` for the OpenAI key (stored in the macOS Keychain under service `com.transcribr.Transcribr` / account `openai.api-key`, encrypted at rest). The adjacent `Clear` button wipes it (deletes the Keychain item); clicking anywhere in the popover outside the field defocuses it (visible confirmation that the value is saved).
 - **Model picker** — pick one of:
   - `whisper-1` — Whisper v2 (2022), baseline.
   - `gpt-4o-mini-transcribe` — **default**. Newer than Whisper v2, half the price, better accuracy.
   - `gpt-4o-transcribe` — best quality, same price as `whisper-1`.
 
-There is a one-shot `.env` migration on the very first launch: if `OPENAI_API_KEY` is set in the process environment or found at `~/.transcribr/.env` / `~/Documents/Transcribr/.env` (also `~/Projects/Transcribr/.env` in `DEBUG` builds), it is imported into `UserDefaults` and an `envMigrationDone` flag is set. After that, `.env` is never re-consulted — clearing the key in the popover sticks across restarts.
+There is a one-shot `.env` migration on the very first launch: if `OPENAI_API_KEY` is set in the process environment or found at `~/.transcribr/.env` / `~/Documents/Transcribr/.env` (also `~/Projects/Transcribr/.env` in `DEBUG` builds), it is imported into the Keychain and an `envMigrationDone` flag is set. After that, `.env` is never re-consulted — clearing the key in the popover sticks across restarts. A separate one-shot migration moves any pre-existing plaintext value from the legacy `UserDefaults` key `transcribr.openAIAPIKey` into the Keychain and removes the plaintext copy.
 
 ## Global mic mute
 
@@ -173,7 +173,7 @@ For transcription, after one of the rows passes: paste an API key in Transcripti
 - **Bluetooth + microphone input quality.** When a Bluetooth headset is selected as the input device, macOS may switch the link into HFP profile (16 kHz mono telephony). The mic track will then be 16 kHz; the system-audio track captured by `SCStream` is unaffected (still 48 kHz stereo, pre-HAL). For best mic quality, use the built-in mic or a wired/USB mic and keep BT for output only.
 - **Auto-restart produces multiple files per session.** Every `AVAudioEngineConfigurationChange` finalizes the current `.m4a` and starts a fresh one — a session where you toggle headphones four times yields five files. Each file is independently transcribable; their `recording-<timestamp>.m4a` names sort chronologically so they're easy to reassemble in post.
 - **Screen Recording permission needs a restart** after the user first enables it in System Settings. macOS does not propagate the new permission to a running process. The app detects this and shows a banner.
-- **API key is stored in `UserDefaults` plaintext** (`~/Library/Preferences/com.transcribr.Transcribr.plist`). Convenient for a local dev app but inappropriate for a shipped binary — a production version should migrate this storage to Keychain.
+- **API key storage.** The OpenAI API key is held in the login Keychain (`kSecClassGenericPassword`, accessibility `kSecAttrAccessibleAfterFirstUnlock`). Earlier builds stored it in `UserDefaults` plaintext; on first launch after the upgrade, that value is migrated into the Keychain and the legacy `UserDefaults` entry is deleted. Note: the app is not sandboxed, so Keychain access goes through the standard "application wants to use confidential information" prompt the first time. Enabling the `App Sandbox` later will require adding a `keychain-access-groups` entitlement.
 - **Ad-hoc code signing reshuffles TCC.** Building from Xcode produces a new CDHash on every source change, and macOS's TCC database keys Screen Recording grants by CDHash for ad-hoc-signed apps. Practical upshot: each rebuild may require re-granting Screen Recording (toggle in Settings → restart). Real Developer ID signing (TeamID-based) eliminates this churn for shipped builds.
 - **No MP3 export.** Recording output is AAC `.m4a` only; MP3 can be added later via `AVAssetExportSession` or `ffmpeg`.
 - **End-of-recording tail**: when End Record is clicked, the last few buffers already scheduled on `AVAudioPlayerNode` are dropped. Acceptable for an MVP.

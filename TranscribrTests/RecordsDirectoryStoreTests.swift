@@ -92,3 +92,57 @@ final class RecordsDirectoryStoreTests: XCTestCase {
         XCTAssertNoThrow(try store.ensureDirectoryExists())
     }
 }
+
+/// Exercises the real login Keychain. Each test uses a unique `service` namespace and
+/// removes its items in `tearDown`, so it never collides with other Keychain entries.
+final class KeychainStoreTests: XCTestCase {
+    private var service: String!
+    private let account = "test.account"
+
+    override func setUp() {
+        super.setUp()
+        service = "test.transcribr.keychain.\(UUID().uuidString)"
+    }
+
+    override func tearDown() {
+        KeychainStore.delete(service: service, account: account)
+        service = nil
+        super.tearDown()
+    }
+
+    func test_setThenGet_roundTripsValue() {
+        XCTAssertTrue(KeychainStore.set("sk-test-123", service: service, account: account))
+        XCTAssertEqual(KeychainStore.get(service: service, account: account), "sk-test-123")
+    }
+
+    func test_set_overwritesExistingValue() {
+        KeychainStore.set("old", service: service, account: account)
+        KeychainStore.set("new", service: service, account: account)
+        XCTAssertEqual(KeychainStore.get(service: service, account: account), "new")
+    }
+
+    func test_setEmptyString_deletesItem() {
+        KeychainStore.set("value", service: service, account: account)
+        XCTAssertTrue(KeychainStore.set("", service: service, account: account))
+        XCTAssertNil(KeychainStore.get(service: service, account: account))
+    }
+
+    func test_get_missingItem_returnsNil() {
+        XCTAssertNil(KeychainStore.get(service: service, account: account))
+    }
+
+    func test_delete_isIdempotent() {
+        XCTAssertTrue(KeychainStore.delete(service: service, account: account))
+        KeychainStore.set("value", service: service, account: account)
+        XCTAssertTrue(KeychainStore.delete(service: service, account: account))
+        XCTAssertTrue(KeychainStore.delete(service: service, account: account))
+        XCTAssertNil(KeychainStore.get(service: service, account: account))
+    }
+
+    func test_unicodeValue_isPreservedExactly() {
+        let value = "ключ-🔑-π"
+        KeychainStore.set(value, service: service, account: account)
+        XCTAssertEqual(KeychainStore.get(service: service, account: account), value)
+    }
+}
+
