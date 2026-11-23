@@ -54,11 +54,25 @@ Inside the popover, the `Transcription Settings` disclosure exposes:
 
 - **API key** — a `SecureField` for the OpenAI key (stored in the macOS Keychain under service `com.transcribr.Transcribr` / account `openai.api-key`, encrypted at rest). The adjacent `Clear` button wipes it (deletes the Keychain item); clicking anywhere in the popover outside the field defocuses it (visible confirmation that the value is saved).
 - **Model picker** — pick one of:
-  - `whisper-1` — Whisper v2 (2022), baseline.
-  - `gpt-4o-mini-transcribe` — **default**. Newer than Whisper v2, half the price, better accuracy.
-  - `gpt-4o-transcribe` — best quality, same price as `whisper-1`.
+  - `gpt-transcribe` — **default**, the model OpenAI recommends for new integrations.
+  - `gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, `whisper-1` — deprecated by OpenAI, shutdown on 2027-02-26 (kept in the list until then). A previously stored `gpt-4o-mini-transcribe` (the old default) is moved to `gpt-transcribe` once on first launch of this version.
 
 There is a one-shot `.env` migration on the very first launch: if `OPENAI_API_KEY` is set in the process environment or found at `~/.transcribr/.env` / `~/Documents/Transcribr/.env` (also `~/Projects/Transcribr/.env` in `DEBUG` builds), it is imported into the Keychain and an `envMigrationDone` flag is set. After that, `.env` is never re-consulted — clearing the key in the popover sticks across restarts. A separate one-shot migration moves any pre-existing plaintext value from the legacy `UserDefaults` key `transcribr.openAIAPIKey` into the Keychain and removes the plaintext copy.
+
+## Quick Record (hotkey)
+
+A second global hotkey, default **Fn + ⇧ + 1**, toggles recording from any app. Press once to
+start, press again to stop. A hotkey stop immediately transcribes the file and then rephrases the
+transcript in simple words (`gpt-6-luna`, same language as the input, no "ё", no long dashes;
+a deterministic sanitizer enforces both even if the model slips). The clipboard ends up with the
+rephrased text; the raw transcript stays in `<name>.txt` and the rewrite is saved next to it as
+`<name>-rephrased.txt`. If the rephrase fails, the raw transcript is still saved and copied.
+
+The manual **Start Record / End Record** buttons keep the old behaviour: no automatic
+transcription and no rephrase. The binding is changeable in the popover (`Quick Record: <combo>
+[Change hotkey]`, right under `Mic Mute`); a combination already used by the other hotkey is
+rejected. Both hotkeys need Accessibility access and are now active from app launch, not only
+after the popover has been opened once.
 
 ## Global mic mute
 

@@ -18,6 +18,9 @@
 		AA0000000000000000000F1 /* Hotkey.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000F2 /* Hotkey.swift */; };
 		AA0000000000000000000F3 /* MicMuteService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000F4 /* MicMuteService.swift */; };
 		AA0000000000000000000F5 /* HotkeyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000F6 /* HotkeyTests.swift */; };
+		AA0000000000000000000F7 /* Rephraser.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000F8 /* Rephraser.swift */; };
+		AA0000000000000000000F9 /* RephraserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000FA /* RephraserTests.swift */; };
+		AA0000000000000000000FB /* WaveformBarsIconTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000FC /* WaveformBarsIconTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -45,6 +48,9 @@
 		AA0000000000000000000F2 /* Hotkey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Hotkey.swift; sourceTree = "<group>"; };
 		AA0000000000000000000F4 /* MicMuteService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicMuteService.swift; sourceTree = "<group>"; };
 		AA0000000000000000000F6 /* HotkeyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotkeyTests.swift; sourceTree = "<group>"; };
+		AA0000000000000000000F8 /* Rephraser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Rephraser.swift; sourceTree = "<group>"; };
+		AA0000000000000000000FA /* RephraserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RephraserTests.swift; sourceTree = "<group>"; };
+		AA0000000000000000000FC /* WaveformBarsIconTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WaveformBarsIconTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -83,6 +89,7 @@
 				AA00000000000000000000D3 /* RecordsDirectoryStore.swift */,
 				AA0000000000000000000F2 /* Hotkey.swift */,
 				AA0000000000000000000F4 /* MicMuteService.swift */,
+				AA0000000000000000000F8 /* Rephraser.swift */,
 				AA00000000000000000000D7 /* Transcribr.entitlements */,
 				AA00000000000000000000A8 /* Assets.xcassets */,
 				AA00000000000000000000AC /* Preview Content */,
@@ -113,6 +120,8 @@
 				AA00000000000000000000EA /* RecordsDirectoryStoreTests.swift */,
 				AA00000000000000000000EE /* AudioRecorderTests.swift */,
 				AA0000000000000000000F6 /* HotkeyTests.swift */,
+				AA0000000000000000000FA /* RephraserTests.swift */,
+				AA0000000000000000000FC /* WaveformBarsIconTests.swift */,
 			);
 			path = TranscribrTests;
 			sourceTree = "<group>";
@@ -223,6 +232,7 @@
 				AA00000000000000000000D6 /* MenuBarContentView.swift in Sources */,
 				AA0000000000000000000F1 /* Hotkey.swift in Sources */,
 				AA0000000000000000000F3 /* MicMuteService.swift in Sources */,
+				AA0000000000000000000F7 /* Rephraser.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -233,6 +243,8 @@
 				AA00000000000000000000EB /* RecordsDirectoryStoreTests.swift in Sources */,
 				AA00000000000000000000EF /* AudioRecorderTests.swift in Sources */,
 				AA0000000000000000000F5 /* HotkeyTests.swift in Sources */,
+				AA0000000000000000000F9 /* RephraserTests.swift in Sources */,
+				AA0000000000000000000FB /* WaveformBarsIconTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

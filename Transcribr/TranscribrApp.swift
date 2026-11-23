@@ -17,10 +17,18 @@ struct TranscribrApp: App {
         let settings = SettingsStore()
         _directoryStore = StateObject(wrappedValue: dirStore)
         _settingsStore = StateObject(wrappedValue: settings)
-        _recorder = StateObject(wrappedValue: AudioRecorder(
-            directoryStore: dirStore,
-            settingsStore: settings
-        ))
+        let audioRecorder = AudioRecorder(directoryStore: dirStore, settingsStore: settings)
+        _recorder = StateObject(wrappedValue: audioRecorder)
+
+        // Wire the Quick Record hotkey and install the event tap at launch: the popover's
+        // `.onAppear` only runs once the user opens it, and the hotkeys must work before that.
+        let muteService = MicMuteService.shared
+        muteService.onQuickRecordHotkey = { [weak audioRecorder] in
+            audioRecorder?.toggleQuickRecord()
+        }
+        Task { @MainActor in
+            muteService.start()
+        }
     }
 
     var body: some Scene {
@@ -34,6 +42,7 @@ struct TranscribrApp: App {
         } label: {
             WaveformBarsIcon(
                 isAnimating: recorder.isRecording,
+                isProcessing: recorder.isTranscriptionBusy,
                 isMuted: micMuteService.isMuted
             )
         }
@@ -44,29 +53,69 @@ struct TranscribrApp: App {
 /// The body must return a single `Image` — `MenuBarExtra` rasterises the label to
 /// `NSStatusItem.button.image`, and wrapping the image in a `TimelineView` or other container
 /// breaks the popover click target on some macOS versions.
+enum IconActivity: Equatable {
+    case idle
+    /// Pulsing bars.
+    case recording
+    /// Transcription and/or rephrase in flight: bars sweep as a travelling wave.
+    case processing
+
+    /// Recording wins when both are true (a new recording can start while the previous one is
+    /// still being transcribed) because it is the state the user must be able to see.
+    static func resolve(isRecording: Bool, isProcessing: Bool) -> IconActivity {
+        if isRecording { return .recording }
+        return isProcessing ? .processing : .idle
+    }
+}
+
 struct WaveformBarsIcon: View {
     let isAnimating: Bool
+    var isProcessing: Bool = false
     let isMuted: Bool
     @State private var tick: UInt64 = 0
 
+    private var activity: IconActivity {
+        IconActivity.resolve(isRecording: isAnimating, isProcessing: isProcessing)
+    }
+
     var body: some View {
-        Image(nsImage: isAnimating
-            ? Self.animatedImage(tick: tick, muted: isMuted)
-            : Self.idleImage(muted: isMuted))
-            .accessibilityLabel(Self.accessibilityLabel(isAnimating: isAnimating, isMuted: isMuted))
+        Image(nsImage: activity == .idle
+            ? Self.idleImage(muted: isMuted)
+            : Self.animatedImage(tick: tick, muted: isMuted, activity: activity))
+            .accessibilityLabel(Self.accessibilityLabel(activity: activity, isMuted: isMuted))
             .onReceive(Self.timerPublisher) { _ in
-                if isAnimating {
+                if activity != .idle {
                     tick = tick &+ 1
                 }
             }
     }
 
-    private static func accessibilityLabel(isAnimating: Bool, isMuted: Bool) -> String {
-        switch (isAnimating, isMuted) {
-        case (true, true): return "Transcribr: recording, microphone muted"
-        case (true, false): return "Transcribr: recording"
-        case (false, true): return "Transcribr: microphone muted"
-        case (false, false): return "Transcribr: idle"
+    static func accessibilityLabel(activity: IconActivity, isMuted: Bool) -> String {
+        switch (activity, isMuted) {
+        case (.recording, true): return "Transcribr: recording, microphone muted"
+        case (.recording, false): return "Transcribr: recording"
+        case (.processing, true): return "Transcribr: transcribing, microphone muted"
+        case (.processing, false): return "Transcribr: transcribing"
+        case (.idle, true): return "Transcribr: microphone muted"
+        case (.idle, false): return "Transcribr: idle"
+        }
+    }
+
+    /// Pure so the motion is unit-testable without rendering. Recording pulses the base
+    /// silhouette; processing sweeps a wave across equal-ish bars (opposite direction, larger
+    /// amplitude) so the two states read differently at menu-bar size.
+    static func barHeight(index: Int, tick: UInt64, activity: IconActivity) -> CGFloat {
+        switch activity {
+        case .idle:
+            return baseBarHeights[index]
+        case .recording:
+            let t = (Double(tick) / 12.0) * 2.0 * .pi * cyclesPerSecond
+            let normalized = (sin(t + Double(index) * 0.9) + 1.0) / 2.0
+            return baseBarHeights[index] * CGFloat(pulseMin + pulseRange * normalized)
+        case .processing:
+            let t = (Double(tick) / 12.0) * 2.0 * .pi * processingCyclesPerSecond
+            let normalized = (sin(t - Double(index) * 1.1) + 1.0) / 2.0
+            return processingMinHeight + (totalHeight - processingMinHeight) * CGFloat(normalized)
         }
     }
 
@@ -83,6 +132,8 @@ struct WaveformBarsIcon: View {
     private static let pulseMin: Double = 0.75
     private static let pulseRange: Double = 0.25
     private static let muteSlashLineWidth: CGFloat = 1.5
+    private static let processingCyclesPerSecond: Double = 1.2
+    private static let processingMinHeight: CGFloat = 3
 
     private static var totalWidth: CGFloat {
         CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * barSpacing
@@ -111,18 +162,13 @@ struct WaveformBarsIcon: View {
         return img
     }
 
-    private static func animatedImage(tick: UInt64, muted: Bool) -> NSImage {
-        let t = (Double(tick) / 12.0) * 2.0 * .pi * cyclesPerSecond
+    private static func animatedImage(tick: UInt64, muted: Bool, activity: IconActivity) -> NSImage {
         let size = NSSize(width: totalWidth, height: totalHeight)
 
         let img = NSImage(size: size, flipped: false) { _ in
             NSColor.black.setFill()
             for i in 0..<barCount {
-                let phase = Double(i) * 0.9
-                let normalized = (sin(t + phase) + 1.0) / 2.0
-                let pulse = pulseMin + pulseRange * normalized
-                let height = baseBarHeights[i] * CGFloat(pulse)
-                drawBar(index: i, height: height)
+                drawBar(index: i, height: barHeight(index: i, tick: tick, activity: activity))
             }
             if muted {
                 drawMuteSlash()

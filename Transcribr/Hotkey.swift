@@ -83,6 +83,76 @@ struct Hotkey: Codable, Equatable, CustomStringConvertible {
     }
 }
 
+/// Actions a global hotkey can trigger. Each action owns its own persisted binding.
+enum HotkeyAction: String, CaseIterable {
+    case micMute
+    case quickRecord
+
+    var defaultsKey: String {
+        switch self {
+        case .micMute: return "transcribr.micMute.hotkey"
+        case .quickRecord: return "transcribr.quickRecord.hotkey"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .micMute: return "Mic Mute"
+        case .quickRecord: return "Quick Record"
+        }
+    }
+
+    /// `Fn+⇧+1` (keyCode 18 = `kVK_ANSI_1`) for quick record. Mute keeps its historic `Fn+⇧+\``.
+    var defaultHotkey: Hotkey {
+        switch self {
+        case .micMute:
+            return .default
+        case .quickRecord:
+            return Hotkey(
+                keyCode: 18,
+                flags: CGEventFlags.maskSecondaryFn.rawValue | CGEventFlags.maskShift.rawValue
+            )
+        }
+    }
+}
+
+/// The current binding of every `HotkeyAction`. Pure value type so matching and conflict
+/// rules are unit-testable without a live event tap.
+struct HotkeyBindings: Equatable {
+    var micMute: Hotkey
+    var quickRecord: Hotkey
+
+    subscript(action: HotkeyAction) -> Hotkey {
+        get {
+            switch action {
+            case .micMute: return micMute
+            case .quickRecord: return quickRecord
+            }
+        }
+        set {
+            switch action {
+            case .micMute: micMute = newValue
+            case .quickRecord: quickRecord = newValue
+            }
+        }
+    }
+
+    /// Action whose binding equals the pressed key + (masked) modifiers, if any.
+    func action(keyCode: Int64, flags: UInt64) -> HotkeyAction? {
+        let masked = flags & Hotkey.modifierMask
+        return HotkeyAction.allCases.first {
+            let binding = self[$0]
+            return binding.keyCode == keyCode && binding.flags == masked
+        }
+    }
+
+    /// Another action already using `candidate`; rebinding to it would make one action
+    /// unreachable because the tap matches only the first hit.
+    func conflictingAction(for candidate: Hotkey, excluding action: HotkeyAction) -> HotkeyAction? {
+        HotkeyAction.allCases.first { $0 != action && self[$0] == candidate }
+    }
+}
+
 /// US-layout virtual key codes from `<HIToolbox/Events.h>` (`kVK_*`). We hardcode the
 /// commonly-bound subset rather than calling `UCKeyTranslate`, which depends on the user's
 /// current keyboard layout and would render differently on, say, AZERTY vs QWERTY for the

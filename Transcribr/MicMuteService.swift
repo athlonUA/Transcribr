@@ -28,18 +28,28 @@ import os
 final class MicMuteService: ObservableObject {
     static let shared = MicMuteService()
 
-    static let hotkeyKey = "transcribr.micMute.hotkey"
+    static let hotkeyKey = HotkeyAction.micMute.defaultsKey
     /// Pre-mute volume so unmute can restore it on devices that fell back to the volume path.
     static let savedVolumeKey = "transcribr.micMute.savedVolume"
 
     @Published private(set) var isMuted: Bool = false
     @Published private(set) var hasAccessibility: Bool = false
-    @Published private(set) var isCapturingHotkey: Bool = false
+    /// Which action's hotkey the in-popover recorder is currently capturing, if any.
+    @Published private(set) var capturingAction: HotkeyAction?
+    /// Why the last captured combination was rejected (e.g. already bound); cleared on the
+    /// next capture start. Lets the popover explain why the recorder stayed armed.
+    @Published private(set) var captureHint: String?
+
+    var isCapturingHotkey: Bool { capturingAction != nil }
+
+    /// Invoked on the main thread when the Quick Record hotkey fires. Set once by the app
+    /// root; kept as a closure so this service doesn't depend on `AudioRecorder`.
+    var onQuickRecordHotkey: (@MainActor () -> Void)?
 
     /// Read on the mach-port thread (tap callback) and written from the main thread (recorder
     /// completion). `OSAllocatedUnfairLock` guarantees atomic visibility — same pattern used
     /// in `RecordingSession.firstSampleReceived` (AudioRecorder.swift).
-    private let hotkeyStorage: OSAllocatedUnfairLock<Hotkey>
+    private let bindingsStorage: OSAllocatedUnfairLock<HotkeyBindings>
 
     /// SwiftUI binds to the published state on this object; mutating `hotkey` from the main
     /// thread fires `objectWillChange` so the popover row re-renders with the new label.
@@ -47,12 +57,20 @@ final class MicMuteService: ObservableObject {
     /// handler) or `MainActor.run`. `Hotkey.init` is the sole sanitisation point; the setter
     /// trusts that any `Hotkey` value already has its flag bits masked.
     var hotkey: Hotkey {
-        get { hotkeyStorage.withLock { $0 } }
-        set {
-            hotkeyStorage.withLock { $0 = newValue }
-            persistHotkey(newValue)
-            objectWillChange.send()
-        }
+        get { hotkey(for: .micMute) }
+        set { setHotkey(newValue, for: .micMute) }
+    }
+
+    var quickRecordHotkey: Hotkey { hotkey(for: .quickRecord) }
+
+    func hotkey(for action: HotkeyAction) -> Hotkey {
+        bindingsStorage.withLock { $0[action] }
+    }
+
+    private func setHotkey(_ newValue: Hotkey, for action: HotkeyAction) {
+        bindingsStorage.withLock { $0[action] = newValue }
+        persistHotkey(newValue, for: action)
+        objectWillChange.send()
     }
 
     private var tap: CFMachPort?
@@ -64,12 +82,23 @@ final class MicMuteService: ObservableObject {
     private var resignActiveObserver: NSObjectProtocol?
 
     private init() {
-        var initial = Hotkey.default
-        if let data = UserDefaults.standard.data(forKey: Self.hotkeyKey),
-           let stored = try? JSONDecoder().decode(Hotkey.self, from: data) {
-            initial = stored
+        func load(_ action: HotkeyAction) -> Hotkey {
+            if let data = UserDefaults.standard.data(forKey: action.defaultsKey),
+               let stored = try? JSONDecoder().decode(Hotkey.self, from: data) {
+                return stored
+            }
+            return action.defaultHotkey
         }
-        self.hotkeyStorage = OSAllocatedUnfairLock(initialState: initial)
+        var initial = HotkeyBindings(
+            micMute: load(.micMute),
+            quickRecord: load(.quickRecord)
+        )
+        // A stored mute hotkey could already equal the new Quick Record default; fall back to
+        // keeping mute as-is and let the user rebind Quick Record rather than losing mute.
+        if initial.quickRecord == initial.micMute {
+            initial.quickRecord = Hotkey(keyCode: 19, flags: initial.micMute.flags)
+        }
+        self.bindingsStorage = OSAllocatedUnfairLock(initialState: initial)
     }
 
     // MARK: - Public API
@@ -110,13 +139,14 @@ final class MicMuteService: ObservableObject {
     }
 
     @MainActor
-    func startCapture(completion: @escaping (Hotkey?) -> Void) {
+    func startCapture(for action: HotkeyAction, completion: @escaping (Hotkey?) -> Void) {
         // Drop any previous capture's completion silently — caller switching capture state
         // mid-recording shouldn't get a phantom nil callback.
         captureCompletion = nil
         cleanupCaptureMonitors()
 
-        isCapturingHotkey = true
+        capturingAction = action
+        captureHint = nil
         captureCompletion = completion
 
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -142,7 +172,7 @@ final class MicMuteService: ObservableObject {
         let completion = captureCompletion
         captureCompletion = nil
         cleanupCaptureMonitors()
-        isCapturingHotkey = false
+        capturingAction = nil
         completion?(nil)
     }
 
@@ -192,6 +222,7 @@ final class MicMuteService: ObservableObject {
             cancelCapture()
             return nil
         }
+        guard let action = capturingAction else { return event }
         let keyCode = Int64(event.keyCode)
         // NSEvent.modifierFlags bit layout is intentionally compatible with CGEventFlags for
         // the modifier bits (.shift / .control / .option / .command / .function), so masking
@@ -203,12 +234,17 @@ final class MicMuteService: ObservableObject {
             return nil
         }
         let newHotkey = Hotkey(keyCode: keyCode, flags: flags)
-        hotkey = newHotkey
+        let bindings = bindingsStorage.withLock { $0 }
+        if let other = bindings.conflictingAction(for: newHotkey, excluding: action) {
+            captureHint = "Already used by \(other.displayName)"
+            return nil
+        }
+        setHotkey(newHotkey, for: action)
 
         let completion = captureCompletion
         captureCompletion = nil
         cleanupCaptureMonitors()
-        isCapturingHotkey = false
+        capturingAction = nil
         completion?(newHotkey)
         return nil
     }
@@ -272,9 +308,9 @@ final class MicMuteService: ObservableObject {
         isMuted = CoreAudioMuteController.readMuteState(deviceID: deviceID)
     }
 
-    private func persistHotkey(_ hotkey: Hotkey) {
+    private func persistHotkey(_ hotkey: Hotkey, for action: HotkeyAction) {
         if let data = try? JSONEncoder().encode(hotkey) {
-            UserDefaults.standard.set(data, forKey: Self.hotkeyKey)
+            UserDefaults.standard.set(data, forKey: action.defaultsKey)
         }
     }
 
@@ -299,17 +335,25 @@ final class MicMuteService: ObservableObject {
             return Unmanaged.passUnretained(event)
 
         case .keyDown:
-            let current = service.hotkeyStorage.withLock { $0 }
-            let eventFlags = event.flags.rawValue
+            let bindings = service.bindingsStorage.withLock { $0 }
             let eventKeyCode = event.getIntegerValueField(.keyboardEventKeycode)
-            if eventKeyCode == current.keyCode,
-               (eventFlags & Hotkey.modifierMask) == (current.flags & Hotkey.modifierMask) {
-                DispatchQueue.main.async {
-                    service.toggle()
-                }
-                return nil // consume — don't let the keystroke leak to focused app
+            guard let action = bindings.action(keyCode: eventKeyCode, flags: event.flags.rawValue) else {
+                return Unmanaged.passUnretained(event)
             }
-            return Unmanaged.passUnretained(event)
+            // Holding the combo auto-repeats keyDown; swallow repeats so a long press can't
+            // flip mute or start/stop a recording several times.
+            let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            if !isRepeat {
+                DispatchQueue.main.async {
+                    switch action {
+                    case .micMute:
+                        service.toggle()
+                    case .quickRecord:
+                        service.onQuickRecordHotkey?()
+                    }
+                }
+            }
+            return nil // consume — don't let the keystroke leak to focused app
 
         default:
             return Unmanaged.passUnretained(event)

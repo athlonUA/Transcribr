@@ -159,4 +159,72 @@ final class HotkeyTests: XCTestCase {
         // blocking valid international/special keys we just don't have a label for.
         XCTAssertTrue(Hotkey.isValidForGlobal(keyCode: 999, flags: 0))
     }
+
+    // MARK: - Actions & bindings
+
+    func test_quickRecordDefault_isFnShiftOne() {
+        let d = HotkeyAction.quickRecord.defaultHotkey
+        XCTAssertEqual(d.keyCode, 18)
+        XCTAssertEqual(d.description, "Fn+⇧+1")
+    }
+
+    func test_micMuteDefault_isUnchanged() {
+        XCTAssertEqual(HotkeyAction.micMute.defaultHotkey, Hotkey.default)
+    }
+
+    func test_defaults_doNotConflictAndUseDistinctStorageKeys() {
+        let bindings = HotkeyBindings(
+            micMute: HotkeyAction.micMute.defaultHotkey,
+            quickRecord: HotkeyAction.quickRecord.defaultHotkey
+        )
+        XCTAssertNil(bindings.conflictingAction(for: bindings.quickRecord, excluding: .quickRecord))
+        XCTAssertEqual(
+            Set(HotkeyAction.allCases.map(\.defaultsKey)).count,
+            HotkeyAction.allCases.count
+        )
+        XCTAssertEqual(HotkeyAction.micMute.defaultsKey, "transcribr.micMute.hotkey")
+    }
+
+    func test_bindings_actionMatchesKeyAndMaskedFlags() {
+        let bindings = HotkeyBindings(
+            micMute: HotkeyAction.micMute.defaultHotkey,
+            quickRecord: HotkeyAction.quickRecord.defaultHotkey
+        )
+        let fnShift = CGEventFlags.maskSecondaryFn.rawValue | CGEventFlags.maskShift.rawValue
+        XCTAssertEqual(bindings.action(keyCode: 18, flags: fnShift), .quickRecord)
+        XCTAssertEqual(bindings.action(keyCode: 50, flags: fnShift), .micMute)
+        // Caps Lock must not break matching.
+        XCTAssertEqual(
+            bindings.action(keyCode: 18, flags: fnShift | CGEventFlags.maskAlphaShift.rawValue),
+            .quickRecord
+        )
+    }
+
+    func test_bindings_actionIsNilForOtherKeyOrModifiers() {
+        let bindings = HotkeyBindings(
+            micMute: HotkeyAction.micMute.defaultHotkey,
+            quickRecord: HotkeyAction.quickRecord.defaultHotkey
+        )
+        let fnShift = CGEventFlags.maskSecondaryFn.rawValue | CGEventFlags.maskShift.rawValue
+        XCTAssertNil(bindings.action(keyCode: 19, flags: fnShift))
+        XCTAssertNil(bindings.action(keyCode: 18, flags: CGEventFlags.maskShift.rawValue))
+        XCTAssertNil(bindings.action(keyCode: 18, flags: 0))
+    }
+
+    func test_bindings_conflictDetectedAgainstOtherActionOnly() {
+        var bindings = HotkeyBindings(
+            micMute: HotkeyAction.micMute.defaultHotkey,
+            quickRecord: HotkeyAction.quickRecord.defaultHotkey
+        )
+        XCTAssertEqual(
+            bindings.conflictingAction(for: bindings.micMute, excluding: .quickRecord),
+            .micMute
+        )
+        // Rebinding an action to its own current combo is not a conflict.
+        XCTAssertNil(bindings.conflictingAction(for: bindings.micMute, excluding: .micMute))
+
+        bindings[.quickRecord] = Hotkey(keyCode: 15, flags: CGEventFlags.maskCommand.rawValue)
+        XCTAssertEqual(bindings.quickRecord.keyCode, 15)
+        XCTAssertEqual(bindings.micMute, HotkeyAction.micMute.defaultHotkey)
+    }
 }

@@ -24,7 +24,7 @@ struct MenuBarContentView: View {
 
             transcriptionSettings
 
-            micMuteRow
+            hotkeyRows
 
             Divider()
 
@@ -69,19 +69,41 @@ struct MenuBarContentView: View {
         }
     }
 
-    /// Inline recorder row tucked under `Transcription Settings`, sharing its visual group
-    /// (no divider between). On `Change hotkey` the right half flips to "Press shortcut…
-    /// Cancel" via `isCapturingHotkey`. No separate sheet / Settings window — popover already
-    /// has key window focus, which is what `NSEvent.addLocalMonitorForEvents` needs.
+    /// Inline hotkey rows tucked under `Transcription Settings`, sharing its visual group (no
+    /// divider between). On `Change hotkey` the right half flips to "Press shortcut… Cancel"
+    /// via `capturingAction`. No separate sheet / Settings window — popover already has key
+    /// window focus, which is what `NSEvent.addLocalMonitorForEvents` needs.
     @ViewBuilder
-    private var micMuteRow: some View {
+    private var hotkeyRows: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            hotkeyRow(
+                action: .micMute,
+                icon: micMuteService.isMuted ? "mic.slash.fill" : "mic.fill",
+                iconStyle: micMuteService.isMuted ? .red : .primary
+            )
+            hotkeyRow(
+                action: .quickRecord,
+                icon: "record.circle",
+                iconStyle: recorder.isRecording ? .red : .primary
+            )
+            if let hint = micMuteService.captureHint {
+                Text(hint)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 8)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func hotkeyRow(action: HotkeyAction, icon: String, iconStyle: Color) -> some View {
         HStack(spacing: 6) {
-            Image(systemName: micMuteService.isMuted ? "mic.slash.fill" : "mic.fill")
-                .foregroundStyle(micMuteService.isMuted ? .red : .primary)
+            Image(systemName: icon)
+                .foregroundStyle(iconStyle)
                 .frame(width: 14)
-            Text("Mic Mute:")
+            Text("\(action.displayName):")
                 .font(.caption)
-            if micMuteService.isCapturingHotkey {
+            if micMuteService.capturingAction == action {
                 Text("Press shortcut…")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
@@ -91,14 +113,13 @@ struct MenuBarContentView: View {
                 }
                 .controlSize(.small)
             } else {
-                Text(micMuteService.hotkey.description)
+                Text(micMuteService.hotkey(for: action).description)
                     .font(.caption.monospaced())
                 Spacer()
                 Button("Change hotkey") {
                     // Completion fires for both success and Esc/cancel paths; we don't need
-                    // either branch — @Published `hotkey` and `isCapturingHotkey` already
-                    // trigger the view refresh.
-                    micMuteService.startCapture { _ in }
+                    // either branch — @Published state already triggers the view refresh.
+                    micMuteService.startCapture(for: action) { _ in }
                 }
                 .controlSize(.small)
             }
@@ -124,7 +145,7 @@ struct MenuBarContentView: View {
             .disabled(
                 recorder.currentURL == nil
                 || recorder.state == .recording
-                || recorder.transcriptionState == .transcribing
+                || recorder.isTranscriptionBusy
             )
 
             Button {
@@ -136,7 +157,7 @@ struct MenuBarContentView: View {
             .controlSize(.regular)
             .buttonStyle(.bordered)
             .tint(.blue)
-            .disabled(recorder.transcriptionState == .transcribing)
+            .disabled(recorder.isTranscriptionBusy)
         }
     }
 
@@ -183,9 +204,13 @@ struct MenuBarContentView: View {
 
     private var header: some View {
         HStack(spacing: 6) {
-            // Header waveform reflects only recording state; the mute slash stays in the
-            // menu-bar tray icon where it's always visible.
-            WaveformBarsIcon(isAnimating: recorder.isRecording, isMuted: false)
+            // Header waveform reflects recording / transcribing state only; the mute slash
+            // stays in the menu-bar tray icon where it's always visible.
+            WaveformBarsIcon(
+                isAnimating: recorder.isRecording,
+                isProcessing: recorder.isTranscriptionBusy,
+                isMuted: false
+            )
             Text("Transcribr")
                 .font(.headline)
             Spacer()
@@ -303,6 +328,18 @@ struct MenuBarContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.blue.opacity(0.10))
+            .cornerRadius(6)
+        case .rephrasing:
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Rephrasing in simple words…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             .padding(8)
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -28,6 +28,8 @@ enum RecorderState: Equatable {
 enum TranscriptionState: Equatable {
     case idle
     case transcribing
+    /// Transcript is already saved and on the clipboard; the simplified version is in flight.
+    case rephrasing
     case completed(URL)
     case failed(String)
 }
@@ -38,18 +40,33 @@ struct TranscriptionProgress: Equatable {
 }
 
 enum TranscriptionModel: String, CaseIterable, Identifiable {
-    case whisper1 = "whisper-1"
+    case gptTranscribe = "gpt-transcribe"
     case gpt4oMiniTranscribe = "gpt-4o-mini-transcribe"
     case gpt4oTranscribe = "gpt-4o-transcribe"
+    case whisper1 = "whisper-1"
 
     var id: String { rawValue }
 
+    /// OpenAI recommends `gpt-transcribe`; the older models are deprecated and shut down on
+    /// 2027-02-26 (https://developers.openai.com/api/docs/deprecations).
+    static let `default`: TranscriptionModel = .gptTranscribe
+
     var displayName: String {
         switch self {
-        case .whisper1: return "Whisper v2 — baseline"
-        case .gpt4oMiniTranscribe: return "GPT-4o mini — recommended"
-        case .gpt4oTranscribe: return "GPT-4o — best quality"
+        case .gptTranscribe: return "GPT Transcribe — recommended"
+        case .gpt4oMiniTranscribe: return "GPT-4o mini — deprecated"
+        case .gpt4oTranscribe: return "GPT-4o — deprecated"
+        case .whisper1: return "Whisper v2 — deprecated"
         }
+    }
+
+    /// Picks the model to use at launch. Before the `gpt-transcribe` migration the default was
+    /// `gpt-4o-mini-transcribe`, so a stored value of exactly that is indistinguishable from
+    /// "never touched" and moves to the new default once; after that, choices are respected.
+    static func resolve(stored: String?, migrationDone: Bool) -> TranscriptionModel {
+        guard let stored, let model = TranscriptionModel(rawValue: stored) else { return .default }
+        if !migrationDone, model == .gpt4oMiniTranscribe { return .default }
+        return model
     }
 }
 
@@ -58,6 +75,7 @@ final class SettingsStore: ObservableObject {
     /// Legacy plaintext location — read once for migration, then cleared.
     static let legacyAPIKeyDefaultsKey = "transcribr.openAIAPIKey"
     static let modelDefaultsKey = "transcribr.transcriptionModel"
+    static let modelMigrationDoneKey = "transcribr.modelMigrationGptTranscribeDone"
     /// Without this flag, clearing the API key from the popover would be silently undone on
     /// the next launch as long as `.env` still exists.
     static let envMigrationDoneKey = "transcribr.envMigrationDone"
@@ -99,8 +117,13 @@ final class SettingsStore: ObservableObject {
         // Marked unconditionally so a later popover-clear sticks regardless of which branch above ran.
         defaults.set(true, forKey: Self.envMigrationDoneKey)
 
-        let rawModel = defaults.string(forKey: Self.modelDefaultsKey)
-        self.transcriptionModel = TranscriptionModel(rawValue: rawModel ?? "") ?? .gpt4oMiniTranscribe
+        let resolvedModel = TranscriptionModel.resolve(
+            stored: defaults.string(forKey: Self.modelDefaultsKey),
+            migrationDone: defaults.bool(forKey: Self.modelMigrationDoneKey)
+        )
+        self.transcriptionModel = resolvedModel
+        defaults.set(resolvedModel.rawValue, forKey: Self.modelDefaultsKey)
+        defaults.set(true, forKey: Self.modelMigrationDoneKey)
     }
 }
 
@@ -212,6 +235,11 @@ final class AudioRecorder: NSObject, ObservableObject {
     /// MainActor-isolated. Persisted to disk + clipboard after every chunk so a crash mid-run
     /// leaves the in-progress transcript already saved.
     private var currentAccumulatedText: String = ""
+
+    /// True while a transcription or its follow-up rephrase is running.
+    var isTranscriptionBusy: Bool {
+        transcriptionState == .transcribing || transcriptionState == .rephrasing
+    }
 
     var canStart: Bool {
         // Mic is optional — a denied mic just makes the session system-audio-only via
@@ -386,7 +414,7 @@ final class AudioRecorder: NSObject, ObservableObject {
             currentURL = newSession.fileURL
             recordingStartedAt = Date()
             // Don't clobber a still-running transcription from a prior recording.
-            if transcriptionState != .transcribing {
+            if !isTranscriptionBusy {
                 transcriptionState = .idle
                 transcriptionProgress = nil
             }
@@ -434,11 +462,40 @@ final class AudioRecorder: NSObject, ObservableObject {
         state = .idle
     }
 
+    /// Quick Record hotkey. Idle: start recording. Recording: stop, then transcribe and
+    /// rephrase the finished file. Other states (starting/stopping) ignore the press so a
+    /// fast double-tap can't race the state machine. Manual Start/End buttons never rephrase.
+    @MainActor
+    func toggleQuickRecord() {
+        switch state {
+        case .idle:
+            guard canStart else { return }
+            start()
+        case .recording:
+            guard !isTranscriptionBusy else {
+                // Stopping is still the right outcome; the user can transcribe the file later.
+                stop()
+                lastError = "Previous transcription is still running. Use Transcribe Last when it finishes."
+                return
+            }
+            state = .stopping
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.performStop()
+                guard self.state == .idle, let url = self.currentURL else { return }
+                self.transcribe(audioURL: url, rephrase: true)
+            }
+        case .starting, .stopping:
+            break
+        }
+    }
+
     /// Validates the API key BEFORE flipping to `.transcribing` so a missing-key tap goes
     /// straight to `.failed` without the popover briefly flashing the spinner.
+    /// `rephrase` chains a simple-words rewrite after a fully successful transcription.
     @MainActor
-    func transcribe(audioURL: URL) {
-        guard transcriptionState != .transcribing else { return }
+    func transcribe(audioURL: URL, rephrase: Bool = false) {
+        guard !isTranscriptionBusy else { return }
         guard !settingsStore.apiKey.isEmpty else {
             transcriptionState = .failed("OpenAI API key is not set. Open Transcription Settings in the popover and paste your key.")
             return
@@ -446,12 +503,12 @@ final class AudioRecorder: NSObject, ObservableObject {
         transcriptionState = .transcribing
         transcriptionProgress = nil
         Task { @MainActor [weak self] in
-            await self?.runTranscription(audioURL: audioURL)
+            await self?.runTranscription(audioURL: audioURL, rephrase: rephrase)
         }
     }
 
     @MainActor
-    private func runTranscription(audioURL: URL) async {
+    private func runTranscription(audioURL: URL, rephrase: Bool) async {
         let apiKey = settingsStore.apiKey
         let txtURL = audioURL.deletingPathExtension().appendingPathExtension("txt")
         // Don't pre-delete `txtURL` — if the very first chunk fails we want any prior
@@ -478,7 +535,11 @@ final class AudioRecorder: NSObject, ObservableObject {
             )
             // Every chunk has already been written + clipboard'd via `onChunkText`.
             transcriptionProgress = nil
-            transcriptionState = .completed(txtURL)
+            if rephrase, !currentAccumulatedText.isEmpty {
+                await runRephrase(of: currentAccumulatedText, audioURL: audioURL, apiKey: apiKey)
+            } else {
+                transcriptionState = .completed(txtURL)
+            }
         } catch let TranscriptionError.partialFailure(_, completed, total, underlying) {
             transcriptionProgress = nil
             if currentAccumulatedText.isEmpty {
@@ -492,6 +553,31 @@ final class AudioRecorder: NSObject, ObservableObject {
             transcriptionProgress = nil
             transcriptionState = .failed("Transcription failed: \(error.localizedDescription)")
         }
+    }
+
+    /// The raw transcript is already on disk and clipboard, so a rephrase failure never loses
+    /// it; the banner just says the simplified version is missing.
+    @MainActor
+    private func runRephrase(of text: String, audioURL: URL, apiKey: String) async {
+        transcriptionState = .rephrasing
+        let rephrasedURL = Self.rephrasedFileURL(for: audioURL)
+        do {
+            let simplified = try await Rephraser(apiKey: apiKey).rephrase(text)
+            try simplified.write(to: rephrasedURL, atomically: true, encoding: .utf8)
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(simplified, forType: .string)
+            transcriptionState = .completed(rephrasedURL)
+        } catch {
+            transcriptionState = .failed("Rephrase failed: \(error.localizedDescription). The original transcript is saved and copied to clipboard.")
+        }
+    }
+
+    static func rephrasedFileURL(for audioURL: URL) -> URL {
+        let stem = audioURL.deletingPathExtension().lastPathComponent
+        return audioURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("\(stem)-rephrased.txt")
     }
 
     @MainActor
@@ -1357,7 +1443,7 @@ private enum TranscriptionError: LocalizedError {
             return "Invalid response from OpenAI."
         case .serverError(let code, let body):
             let trimmed = body.prefix(200)
-            return "OpenAI error \(code): \(trimmed)"
+            return OpenAIErrorHint.describe(statusCode: code, body: String(trimmed))
         case .fileTooLarge(let size, let limit):
             let sizeMB = Double(size) / 1_048_576
             let limitMB = Double(limit) / 1_048_576
